@@ -1,0 +1,603 @@
+const express = require('express');
+const Airtable = require('airtable');
+const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
+const bodyParser = require('body-parser');
+const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const path = require('path');
+require('dotenv').config();
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Security middleware
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com", "https://cdnjs.cloudflare.com"],
+      fontSrc: ["'self'", "https://fonts.gstatic.com"],
+      scriptSrc: ["'self'", "'unsafe-inline'", "https://cdn.jsdelivr.net", "https://airtable.com"],
+      imgSrc: ["'self'", "data:", "https:"],
+      frameSrc: ["'self'", "https://airtable.com"],
+      connectSrc: ["'self'", "https://api.airtable.com"]
+    }
+  }
+}));
+
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // limit each IP to 100 requests per windowMs
+  message: 'Too many requests from this IP, please try again later.'
+});
+app.use(limiter);
+
+// Middleware
+app.use(cors());
+app.use(bodyParser.json());
+app.use(bodyParser.urlencoded({ extended: true }));
+app.use(express.static('public'));
+
+// Airtable configuration
+const base = new Airtable({ apiKey: process.env.AIRTABLE_API_KEY }).base(process.env.AIRTABLE_BASE_ID);
+
+// JWT token verification middleware
+const verifyToken = (req, res, next) => {
+  const token = req.params.token || req.body.token;
+  
+  if (!token) {
+    return res.status(401).json({ success: false, message: 'No token provided' });
+  }
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    req.user = decoded;
+    next();
+  } catch (error) {
+    return res.status(401).json({ success: false, message: 'Invalid or expired token' });
+  }
+};
+
+// Helper function to generate magic link
+const generateMagicLink = (startupId, startupName, email) => {
+  const token = jwt.sign(
+    { 
+      startupId, 
+      startupName, 
+      email,
+      timestamp: Date.now()
+    },
+    process.env.JWT_SECRET,
+    { expiresIn: '15m' }
+  );
+  
+  const baseUrl = process.env.NODE_ENV === 'production' 
+    ? `https://${process.env.REPLIT_DEV_DOMAIN}`
+    : `http://localhost:${PORT}`;
+    
+  return `${baseUrl}/dashboard/${token}`;
+};
+
+// Routes
+
+// Landing page
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+// Email lookup and magic link generation
+app.post('/lookup-email', async (req, res) => {
+  try {
+    const { email } = req.body;
+    
+    if (!email) {
+      return res.status(400).json({ success: false, message: 'Email is required' });
+    }
+
+    let startup = null;
+    let accessType = null; // 'onboarding' or 'management'
+    let targetTable = null;
+
+    // STEP 1: Check EOI table for approved startups, then check if they need onboarding
+    try {
+      const eoiRecords = await base(process.env.UTS_EOI_TABLE_ID).select({
+        filterByFormula: `AND({Email} = "${email}", {Status} = "Approved")`
+      }).firstPage();
+
+      if (eoiRecords.length > 0) {
+        const eoiRecord = eoiRecords[0];
+        const startupName = eoiRecord.get('Startup Name');
+        
+        // Now check if this startup exists in Startups table and onboarding status
+        try {
+          const startupRecords = await base(process.env.UTS_STARTUPS_TABLE_ID).select({
+            filterByFormula: `{Startup Name (or working title)} = "${startupName}"`
+          }).firstPage();
+          
+          if (startupRecords.length > 0) {
+            // Startup exists in Startups table - check onboarding status
+            const startupRecord = startupRecords[0];
+            const onboardingSubmitted = startupRecord.get('Onboarding Submitted') || 0;
+            
+            if (onboardingSubmitted === 0) {
+              // Needs onboarding - store magic link in EOI table
+              startup = {
+                id: eoiRecord.id,
+                name: startupName,
+                primaryContact: email,
+                status: eoiRecord.get('Status'),
+                isEOIApproved: true,
+                needsOnboarding: true
+              };
+              accessType = 'onboarding';
+              targetTable = process.env.UTS_EOI_TABLE_ID;
+            } else {
+              // Already onboarded - treat as management (use startups table)
+              startup = {
+                id: startupRecord.id,
+                name: startupRecord.get('Startup Name (or working title)'),
+                primaryContact: email,
+                recordId: startupRecord.get('Record ID'),
+                status: startupRecord.get('Startup status'),
+                isEOIApproved: false,
+                needsOnboarding: false
+              };
+              accessType = 'management';
+              targetTable = process.env.UTS_STARTUPS_TABLE_ID;
+            }
+          } else {
+            // EOI approved but no startup record yet - needs onboarding
+            startup = {
+              id: eoiRecord.id,
+              name: startupName,
+              primaryContact: email,
+              status: eoiRecord.get('Status'),
+              isEOIApproved: true,
+              needsOnboarding: true
+            };
+            accessType = 'onboarding';
+            targetTable = process.env.UTS_EOI_TABLE_ID;
+          }
+        } catch (startupError) {
+          console.log('Error checking startup table:', startupError.message);
+          // Fallback to onboarding flow
+          startup = {
+            id: eoiRecord.id,
+            name: startupName,
+            primaryContact: email,
+            status: eoiRecord.get('Status'),
+            isEOIApproved: true,
+            needsOnboarding: true
+          };
+          accessType = 'onboarding';
+          targetTable = process.env.UTS_EOI_TABLE_ID;
+        }
+      }
+    } catch (error) {
+      console.log('EOI table check failed:', error.message);
+    }
+
+    // STEP 2: If not onboarding, check UTS Startups table for management
+    if (!startup) {
+      try {
+        const startupRecords = await base(process.env.UTS_STARTUPS_TABLE_ID).select({
+          filterByFormula: `{Primary contact email} = "${email}"`
+        }).firstPage();
+
+        if (startupRecords.length > 0) {
+          const startupRecord = startupRecords[0];
+          startup = {
+            id: startupRecord.id,
+            name: startupRecord.get('Startup Name (or working title)'),
+            primaryContact: email,
+            recordId: startupRecord.get('Record ID'),
+            status: startupRecord.get('Startup status'),
+            isEOIApproved: false,
+            needsOnboarding: false
+          };
+          accessType = 'management';
+          targetTable = process.env.UTS_STARTUPS_TABLE_ID;
+        }
+      } catch (error) {
+        console.log('Startups table check failed:', error.message);
+      }
+    }
+
+
+
+    if (!startup) {
+      return res.status(404).json({ 
+        success: false, 
+        message: 'Email not found in our system. Please ensure you have submitted an EOI and it has been approved, or you are the primary contact for an existing startup.' 
+      });
+    }
+
+    // Generate magic link
+    const magicLink = generateMagicLink(startup.id, startup.name, email);
+    const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
+
+    // Update the target table with magic link
+    await base(targetTable).update(startup.id, {
+      'Magic Link': magicLink,
+      'Token Expires At': expiresAt.toISOString(),
+      'Link': magicLink
+    });
+
+    // Provide different messages based on access type
+    let message = 'Magic link generated successfully!';
+    if (accessType === 'onboarding') {
+      message = 'Welcome! Complete your startup onboarding process.';
+    } else if (accessType === 'management') {
+      message = 'Access your startup dashboard to manage your team.';
+    }
+
+    res.json({ 
+      success: true, 
+      message: message,
+      accessType: accessType,
+      magicLink: magicLink // In production, this would be sent via email
+    });
+
+  } catch (error) {
+    console.error('Email lookup error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'An error occurred while processing your request. Please try again.' 
+    });
+  }
+});
+
+// Dashboard route
+app.get('/dashboard/:token', verifyToken, async (req, res) => {
+  try {
+    const { startupId, startupName, email } = req.user;
+
+    // Get startup information
+    let startup = null;
+    let isEOIApproved = false;
+
+    // First try EOI table
+    try {
+      const eoiRecord = await base(process.env.UTS_EOI_TABLE_ID).find(startupId);
+      startup = {
+        id: eoiRecord.id,
+        name: eoiRecord.get('Startup Name (or working title)'),
+        primaryContact: eoiRecord.get('Primary contact email'),
+        status: eoiRecord.get('Status'),
+        onboardingSubmitted: eoiRecord.get('Onboarding Submitted') || 0
+      };
+      isEOIApproved = true;
+    } catch (error) {
+      // Try UTS Startups table
+      try {
+        const startupRecord = await base(process.env.UTS_STARTUPS_TABLE_ID).find(startupId);
+        startup = {
+          id: startupRecord.id,
+          name: startupRecord.get('Startup Name (or working title)'),
+          primaryContact: startupRecord.get('Primary contact email'),
+          recordId: startupRecord.get('Record ID'),
+          status: startupRecord.get('Startup status'),
+          onboardingSubmitted: startupRecord.get('Onboarding Submitted') || 0
+        };
+      } catch (innerError) {
+        throw new Error('Startup not found');
+      }
+    }
+
+    // Get team members
+    const teamMemberRecords = await base(process.env.TEAM_MEMBERS_TABLE_ID).select({
+      filterByFormula: `{Startup*} = "${startup.name}"`
+    }).firstPage();
+
+    const teamMembers = teamMemberRecords.map(record => ({
+      id: record.id,
+      name: record.get('Team member ID') || 'Unknown',
+      email: record.get('Personal email*'),
+      mobile: record.get('Mobile*'),
+      position: record.get('Position at startup*'),
+      utsAssociation: record.get('What is your association to UTS?*'),
+      status: record.get('Team Member Status')
+    }));
+
+    const dashboardData = {
+      startup,
+      teamMembers,
+      token: req.params.token,
+      isEOIApproved,
+      formUrls: {
+        startupOnboarding: process.env.STARTUP_ONBOARDING_FORM_URL,
+        teamMember: process.env.TEAM_MEMBER_FORM_URL
+      }
+    };
+
+    res.send(generateDashboardHTML(dashboardData));
+
+  } catch (error) {
+    console.error('Dashboard error:', error);
+    res.status(500).send(`
+      <html>
+        <head>
+          <title>Error - UTS Startup Portal</title>
+          <style>
+            body { font-family: Arial, sans-serif; text-align: center; padding: 50px; }
+            .error { color: #e74c3c; }
+          </style>
+        </head>
+        <body>
+          <h1 class="error">Error Loading Dashboard</h1>
+          <p>An error occurred while loading your dashboard. Please try again.</p>
+          <a href="/">Return to Home</a>
+        </body>
+      </html>
+    `);
+  }
+});
+
+// Update profile endpoint
+app.post('/update-profile', verifyToken, async (req, res) => {
+  try {
+    const { memberId, updates } = req.body;
+
+    if (!memberId || !updates) {
+      return res.status(400).json({ success: false, message: 'Missing required fields' });
+    }
+
+    await base(process.env.TEAM_MEMBERS_TABLE_ID).update(memberId, updates);
+
+    res.json({ success: true, message: 'Profile updated successfully!' });
+
+  } catch (error) {
+    console.error('Profile update error:', error);
+    res.status(500).json({ success: false, message: 'Failed to update profile. Please try again.' });
+  }
+});
+
+// Complete onboarding endpoint
+app.post('/complete-onboarding', verifyToken, async (req, res) => {
+  try {
+    const { startupId, startupName } = req.user;
+
+    // Find or create the startup record in UTS Startups table
+    try {
+      const startupRecords = await base(process.env.UTS_STARTUPS_TABLE_ID).select({
+        filterByFormula: `{Startup Name (or working title)} = "${startupName}"`
+      }).firstPage();
+
+      if (startupRecords.length > 0) {
+        // Update existing startup record
+        const startupRecord = startupRecords[0];
+        await base(process.env.UTS_STARTUPS_TABLE_ID).update(startupRecord.id, {
+          'Onboarding Submitted': 1
+        });
+      } else {
+        // This shouldn't normally happen if onboarding forms create the record
+        // But as a fallback, we could create it here
+        console.log('Warning: Startup record not found in UTS Startups table during onboarding completion');
+      }
+
+      res.json({ success: true, message: 'Onboarding completed successfully!' });
+
+    } catch (error) {
+      console.error('Error updating startup record:', error);
+      res.status(500).json({ success: false, message: 'Failed to complete onboarding. Please try again.' });
+    }
+
+  } catch (error) {
+    console.error('Complete onboarding error:', error);
+    res.status(500).json({ success: false, message: 'Failed to complete onboarding. Please try again.' });
+  }
+});
+
+// Generate dashboard HTML
+function generateDashboardHTML(data) {
+  const { startup, teamMembers, token, isEOIApproved, formUrls } = data;
+  
+  return `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>${startup.name} - UTS Startup Portal</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
+    <link rel="stylesheet" href="/css/dashboard.css">
+</head>
+<body>
+    <div class="dashboard-container">
+        <!-- Header -->
+        <header class="dashboard-header">
+            <div class="header-content">
+                <div class="logo-section">
+                    <i class="fas fa-rocket"></i>
+                    <h1>UTS Startup Portal</h1>
+                </div>
+                <div class="startup-info">
+                    <h2>${startup.name}</h2>
+                    <span class="status-badge ${startup.status?.toLowerCase().replace(/\s+/g, '-') || 'pending'}">${startup.status || 'Pending'}</span>
+                </div>
+            </div>
+        </header>
+
+        <!-- Main Content -->
+        <main class="dashboard-main">
+            ${isEOIApproved && startup.onboardingSubmitted === 0 ? generateOnboardingFlow(startup, formUrls, token) : ''}
+            
+            <!-- Team Management Section -->
+            <section class="team-section">
+                <div class="section-header">
+                    <h3><i class="fas fa-users"></i> Team Management</h3>
+                    <p>Manage your team members and their information</p>
+                </div>
+                
+                <div class="team-grid">
+                    ${teamMembers.map(member => generateTeamMemberCard(member, token)).join('')}
+                </div>
+                
+                ${teamMembers.length === 0 ? `
+                <div class="empty-state">
+                    <i class="fas fa-user-plus"></i>
+                    <h4>No team members yet</h4>
+                    <p>Add team members through the onboarding process above</p>
+                </div>
+                ` : ''}
+            </section>
+        </main>
+    </div>
+
+    <script src="/js/dashboard.js"></script>
+    <script>
+        // Initialize dashboard with data
+        window.dashboardData = ${JSON.stringify(data)};
+    </script>
+</body>
+</html>`;
+}
+
+function generateOnboardingFlow(startup, formUrls, token) {
+  return `
+    <section class="onboarding-section">
+        <div class="section-header">
+            <h3><i class="fas fa-clipboard-check"></i> Complete Your Onboarding</h3>
+            <p>Follow these steps to complete your startup registration</p>
+        </div>
+        
+        <div class="onboarding-flow">
+            <div class="onboarding-step active" data-step="1">
+                <div class="step-header">
+                    <div class="step-number">1</div>
+                    <div class="step-info">
+                        <h4>Startup Information</h4>
+                        <p>Complete your startup details</p>
+                    </div>
+                    <div class="step-status">
+                        <i class="fas fa-clock"></i>
+                    </div>
+                </div>
+                <div class="step-content">
+                    <div class="form-embed-container">
+                        <iframe 
+                            src="${formUrls.startupOnboarding}"
+                            class="airtable-embed"
+                            frameborder="0"
+                            onmousewheel=""
+                            width="100%"
+                            height="100%"
+                            style="background: transparent; border: 1px solid #ccc; border-radius: 12px; min-height: 600px;">
+                        </iframe>
+                    </div>
+                </div>
+            </div>
+
+            <div class="onboarding-step" data-step="2">
+                <div class="step-header">
+                    <div class="step-number">2</div>
+                    <div class="step-info">
+                        <h4>Startup Representative</h4>
+                        <p>Add the primary contact information</p>
+                    </div>
+                    <div class="step-status">
+                        <i class="fas fa-clock"></i>
+                    </div>
+                </div>
+                <div class="step-content">
+                    <div class="form-embed-container">
+                        <iframe 
+                            src="${formUrls.teamMember}"
+                            class="airtable-embed"
+                            frameborder="0"
+                            onmousewheel=""
+                            width="100%"
+                            height="100%"
+                            style="background: transparent; border: 1px solid #ccc; border-radius: 12px; min-height: 600px;">
+                        </iframe>
+                    </div>
+                </div>
+            </div>
+
+            <div class="onboarding-step" data-step="3">
+                <div class="step-header">
+                    <div class="step-number">3</div>
+                    <div class="step-info">
+                        <h4>Team Members</h4>
+                        <p>Add your team members</p>
+                    </div>
+                    <div class="step-status">
+                        <i class="fas fa-clock"></i>
+                    </div>
+                </div>
+                <div class="step-content">
+                    <div class="team-members-container">
+                        <div class="team-member-form-container">
+                            <iframe 
+                                src="${formUrls.teamMember}"
+                                class="airtable-embed team-member-form"
+                                frameborder="0"
+                                onmousewheel=""
+                                width="100%"
+                                height="100%"
+                                style="background: transparent; border: 1px solid #ccc; border-radius: 12px; min-height: 600px;">
+                            </iframe>
+                        </div>
+                        
+                        <div class="add-member-actions">
+                            <button class="btn btn-secondary add-member-btn" onclick="addAnotherTeamMember()">
+                                <i class="fas fa-plus"></i> Add Another Team Member
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="onboarding-completion">
+                <button class="btn btn-primary complete-onboarding-btn" onclick="completeOnboarding('${token}')">
+                    <i class="fas fa-check"></i> Complete Onboarding
+                </button>
+            </div>
+        </div>
+    </section>`;
+}
+
+function generateTeamMemberCard(member, token) {
+  return `
+    <div class="team-member-card" data-member-id="${member.id}">
+        <div class="member-avatar">
+            <i class="fas fa-user"></i>
+        </div>
+        <div class="member-info">
+            <h4>${member.name || 'Unknown Name'}</h4>
+            <p class="member-position">${member.position || 'No position specified'}</p>
+            <div class="member-details">
+                <div class="detail-item">
+                    <i class="fas fa-envelope"></i>
+                    <span>${member.email || 'No email'}</span>
+                </div>
+                <div class="detail-item">
+                    <i class="fas fa-phone"></i>
+                    <span>${member.mobile || 'No mobile'}</span>
+                </div>
+                <div class="detail-item">
+                    <i class="fas fa-university"></i>
+                    <span>${member.utsAssociation || 'No UTS association'}</span>
+                </div>
+            </div>
+        </div>
+        <div class="member-actions">
+            <button class="btn btn-outline edit-member-btn" onclick="editTeamMember('${member.id}', '${token}')">
+                <i class="fas fa-edit"></i> Edit
+            </button>
+        </div>
+    </div>`;
+}
+
+// Start server
+app.listen(PORT, () => {
+  console.log(`🚀 UTS Startup Portal running on port ${PORT}`);
+  console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
+});
+
+module.exports = app; 
