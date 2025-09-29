@@ -32,7 +32,7 @@ app.use(helmet({
 
 // Rate limiting
 const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
+  windowMs: 90 * 60 * 1000, // 90 minutes
   max: 100, // limit each IP to 100 requests per windowMs
   message: 'Too many requests from this IP, please try again later.'
 });
@@ -60,7 +60,8 @@ const verifyToken = (req, res, next) => {
     req.user = decoded;
     next();
   } catch (error) {
-    return res.status(401).json({ success: false, message: 'Invalid or expired token' });
+    return res.status(401).json({message: 'Incorrect or expired link, please request a new one.'}); 
+    //success: false, message: 'Invalid or expired token' });
   }
 };
 
