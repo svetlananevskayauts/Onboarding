@@ -1819,18 +1819,14 @@ app.post('/validate-and-generate/:token', orchestratorLimiter, verifyToken, asyn
         log('info', 'orchestrator.pdf.start', { filename }, req);
         const pdfBuffer = await generatePdfBuffer(payload);
 
-        // Cache and issue two one-time URLs: one for Airtable attach, one for user
+        // Cache and issue a one-time URL for Airtable attach (user will get a stable redirect URL)
         const tmpDir = path.join(os.tmpdir(), 'pdf-cache');
         await fs.ensureDir(tmpDir);
         const tokenAirtable = crypto.randomBytes(12).toString('hex');
         const filePathA = path.join(tmpDir, `${tokenAirtable}.pdf`);
         await fs.writeFile(filePathA, pdfBuffer);
-        const tokenUser = crypto.randomBytes(12).toString('hex');
-        const filePathU = path.join(tmpDir, `${tokenUser}.pdf`);
-        await fs.writeFile(filePathU, pdfBuffer);
         const expiresAt = new Date(Date.now() + URL_TTL_SECONDS * 1000);
         PDF_TOKENS.set(tokenAirtable, { filePath: filePathA, expiresAt, filename });
-        PDF_TOKENS.set(tokenUser,    { filePath: filePathU, expiresAt, filename });
 
         // Attach to Airtable Startups 'Agreement' field (append)
         try {
@@ -1855,7 +1851,8 @@ app.post('/validate-and-generate/:token', orchestratorLimiter, verifyToken, asyn
         }
 
         job.state = 'done';
-        job.result = { pdf: { url: `${pdfBaseUrl(req)}/download/${tokenUser}`, filename, expiresAt: expiresAt.toISOString() }, validations: results };
+        const stableUrl = `${pdfBaseUrl(req)}/agreement/latest/${req.params.token}`;
+        job.result = { pdf: { url: stableUrl, filename }, validations: results };
         job.finishedAt = new Date().toISOString();
         log('info', 'orchestrator.done', { filename, expiresAt: expiresAt.toISOString() }, req);
       } catch (e) {
@@ -1888,6 +1885,32 @@ app.get('/job-status/:token', verifyToken, async (req, res) => {
   }
 });
 
+// Stable redirect to latest Agreement attachment (user-facing download)
+app.get('/agreement/latest/:token', verifyToken, async (req, res) => {
+  try {
+    let startupRecordId = getStartupRecordIdFromReqUser(req);
+    if (!startupRecordId) startupRecordId = await resolveStartupRecordIdFromEOI(req.user?.startupId);
+    if (!startupRecordId) return res.status(400).send('No linked UTS Startups record found for this token.');
+
+    const tableId = process.env.UTS_STARTUPS_TABLE_ID;
+    const agreementField = process.env.AIRTABLE_UNSIGNED_AGREEMENT_FIELD || 'Agreement';
+
+    let rec;
+    try { rec = await airtableBase(tableId).find(startupRecordId); }
+    catch (e) { return res.status(404).send('Startup record not found.'); }
+
+    const arr = Array.isArray(rec.get(agreementField)) ? rec.get(agreementField) : [];
+    if (!arr || arr.length === 0) return res.status(404).send('No agreement found.');
+    // Latest is the one appended last
+    const latest = arr[arr.length - 1];
+    if (!latest || !latest.url) return res.status(404).send('Agreement URL missing.');
+
+    res.setHeader('Cache-Control','no-store');
+    return res.redirect(302, latest.url);
+  } catch (_) {
+    return res.status(500).send('Failed to resolve latest agreement.');
+  }
+});
 // ------------------------------
 // Airtable Attachments Health Check
 // Confirms whether attachment fields are writable by attempting a no-op update
