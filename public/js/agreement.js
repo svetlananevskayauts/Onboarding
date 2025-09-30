@@ -1,4 +1,4 @@
-﻿// Agreement Validation Page Script
+// Agreement Validation Page Script
 document.addEventListener('DOMContentLoaded', () => {
   const token = window.agreementData?.token;
   const statusEl = document.getElementById('job-status');
@@ -96,17 +96,24 @@ function renderMembers(tbody, members) {
   tbody.innerHTML = '';
   members.forEach(m => {
     const tr = document.createElement('tr');
+    const fallback = 'N/A'; // ASCII-only universal placeholder
+
     const nameTd = document.createElement('td');
-    nameTd.textContent = m.name || m.id || 'â€”';
+    nameTd.textContent = (m.name || m.id || '').toString().trim() || fallback;
+
     const typeTd = document.createElement('td');
-    typeTd.textContent = m.type || 'â€”';
+    typeTd.textContent = (m.type || '').toString().trim() || fallback;
+
     const discTd = document.createElement('td');
-    discTd.textContent = m.expected_bucket || 'â€”';
+    discTd.textContent = (m.expected_bucket || '').toString().trim() || fallback;
+
     const statusTd = document.createElement('td');
     statusTd.className = 'status-cell';
     statusTd.innerHTML = statusIcon(m);
+
     const reasonTd = document.createElement('td');
     reasonTd.textContent = renderReason(m);
+
     tr.appendChild(nameTd);
     tr.appendChild(typeTd);
     tr.appendChild(discTd);
@@ -117,11 +124,11 @@ function renderMembers(tbody, members) {
 }
 
 function statusIcon(m) {
-  const s = (m.status || "queued").toLowerCase();
-  if (s === "valid") return "<i class=\"fas fa-check ok\"></i>";
-  if (s === "invalid" || s === "error") return "<i class=\"fas fa-times bad\"></i>";
-  if (s === "ambiguous") return "<i class=\"fas fa-exclamation-triangle warn\"></i>";
-  return "<i class=\"fas fa-spinner fa-spin pending\"></i>";
+  const s = (m.status || 'queued').toLowerCase();
+  if (s === 'valid') return '<i class="fas fa-check ok" aria-label="Valid"></i>';
+  if (s === 'invalid' || s === 'error') return '<i class="fas fa-times bad" aria-label="Invalid"></i>';
+  if (s === 'ambiguous') return '<i class="fas fa-exclamation-triangle warn" aria-label="Ambiguous"></i>';
+  return '<i class="fas fa-spinner fa-spin pending" aria-label="Pending"></i>';
 }
 
 function renderReason(m) {
@@ -133,5 +140,4 @@ function renderReason(m) {
   if (s === 'valid') return 'Validated';
   return '';
 }
-
 

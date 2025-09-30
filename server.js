@@ -56,6 +56,37 @@ const orchestratorLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false
 });
+const skyRefreshLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 2,
+  standardHeaders: true,
+  legacyHeaders: false
+});
+
+// SKY refresh scheduler config/state
+const SKY_REFRESH_CHECK_INTERVAL_MS = Number(process.env.SKY_REFRESH_CHECK_INTERVAL_MS || 60000);
+const SKY_REFRESH_SKEW_SECONDS = Number(process.env.SKY_REFRESH_SKEW_SECONDS || 300);
+const SKY_REFRESH_STATE = { refreshing: false, lastAttempt: null, lastResult: null, failCount: 0 };
+
+// Admin Alerts (Airtable) for critical events
+const ADMIN_ALERTS_TABLE_ID = process.env.ADMIN_ALERTS_TABLE_ID || 'tblWd85LhYxtHUXDf';
+let _lastInvalidGrantAlertAt = 0;
+async function createAdminAlert(type, notes) {
+  if (!ADMIN_ALERTS_TABLE_ID) return { skipped: true };
+  const fields = {
+    Type: type,
+    Timestamp: new Date().toISOString(),
+    Notes: String(notes || '')
+  };
+  try {
+    await base(ADMIN_ALERTS_TABLE_ID).create(fields);
+    log('warn', 'admin_alert.created', { type });
+    return { ok: true };
+  } catch (e) {
+    log('error', 'admin_alert.failed', { type, message: e.message });
+    return { error: e.message };
+  }
+}
 
 // Middleware
 app.use(cors());
@@ -151,7 +182,34 @@ const verifyInternalOrJWT = (req, res, next) => {
   return res.status(401).json({ success: false, message: 'Unauthorized' });
 };
 
-// SKY token refresh helper (spawns 56eration/oauth_refresh.js)
+// Reload only SKY-related env keys from .env (avoid overwriting Replit Secrets wholesale)
+function reloadSkyKeysFromDotenv() {
+  try {
+    const envPath = path.resolve('.env');
+    if (!fs.existsSync(envPath)) return { updated: [] };
+    const text = fs.readFileSync(envPath, 'utf8');
+    const map = Object.create(null);
+    (text || '').split(/\r?\n/).forEach((ln) => {
+      const m = ln.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+      if (m) map[m[1]] = m[2];
+    });
+    const keys = ['SKY_ACCESS_TOKEN', 'SKY_TOKEN_OBTAINED_AT', 'SKY_TOKEN_EXPIRES_AT'];
+    const updated = [];
+    for (const k of keys) {
+      if (Object.prototype.hasOwnProperty.call(map, k)) {
+        process.env[k] = map[k];
+        updated.push(k);
+      }
+    }
+    if (updated.length) log('info', 'sky.reload_env', { keys: updated });
+    return { updated };
+  } catch (e) {
+    log('warn', 'sky.reload_env.error', { message: e.message });
+    return { error: e.message };
+  }
+}
+
+// SKY token refresh helper (spawns validation_generation/oauth_refresh.js)
 function runSkyRefresh() {
   return new Promise((resolve) => {
     const cp = spawn(process.execPath, ['validation_generation/oauth_refresh.js'], { stdio: ['ignore', 'pipe', 'pipe'] });
@@ -161,10 +219,25 @@ function runSkyRefresh() {
     cp.stderr.on('data', c => err += c.toString());
     cp.on('exit', (code) => {
       if (code === 0) {
-        try { require('dotenv').config({ override: true }); } catch (_) {}
+        // Only pull in the SKY_* keys written by the refresher
+        try { reloadSkyKeysFromDotenv(); } catch (_) {}
+        // After a successful refresh, schedule the next pre-expiry check
+        try { scheduleNextSkyRefreshCheck('post_refresh'); } catch (_) {}
         return resolve({ ok: true, out: out.trim() });
       }
-      resolve({ ok: false, err: err.trim(), code });
+      const payload = { ok: false, err: err.trim(), code };
+      const isInvalidGrant = (code === 10) || /invalid_grant/i.test(payload.err || '');
+      if (isInvalidGrant) {
+        const now = Date.now();
+        // throttle to at most one alert per 60 minutes
+        if (now - _lastInvalidGrantAlertAt > 60 * 60 * 1000) {
+          _lastInvalidGrantAlertAt = now;
+          const note = `Refresh failed with invalid_grant. Code=${code}. Output=${(out||'').slice(0,200)} Err=${(payload.err||'').slice(0,200)}`;
+          Promise.resolve(createAdminAlert('SKY Invalid Grant', note)).finally(() => resolve(payload));
+          return;
+        }
+      }
+      resolve(payload);
     });
   });
 }
@@ -629,7 +702,6 @@ app.post('/discount-check', discountLimiter, verifyInternalOrJWT, async (req, re
       if ((result && result.raw && (result.raw.statusCode === 401 || result.raw.status === 401)) || /401/.test(String(result?.reason || ''))) {
         const rf = await runSkyRefresh();
         if (rf && rf.ok) {
-          try { require('dotenv').config({ override: true }); } catch (_) {}
           result = await validator.validateDiscount({ search_id, expected_bucket: expected, email, name, dob }, { debug });
         }
       }
@@ -1027,6 +1099,15 @@ function decodeJwtExpIso(token) {
   return null;
 }
 
+function skyTokenTtlSeconds() {
+  try {
+    const iso = decodeJwtExpIso(process.env.SKY_ACCESS_TOKEN || '');
+    if (!iso) return null;
+    const ms = new Date(iso).getTime() - Date.now();
+    return Math.max(0, Math.round(ms / 1000));
+  } catch (_) { return null; }
+}
+
 app.get('/sky-status', verifyInternalOrJWT, async (req, res) => {
   try {
     const access = (process.env.SKY_ACCESS_TOKEN || '').trim();
@@ -1039,6 +1120,7 @@ app.get('/sky-status', verifyInternalOrJWT, async (req, res) => {
     }
 
     const expIso = decodeJwtExpIso(access);
+    const ttlSec = skyTokenTtlSeconds();
     let refreshed = false;
 
     const validator = require('./validation_generation/validation/blackbaudDiscountValidator');
@@ -1047,20 +1129,108 @@ app.get('/sky-status', verifyInternalOrJWT, async (req, res) => {
       const rf = await runSkyRefresh();
       if (rf && rf.ok) {
         refreshed = true;
-        try { require('dotenv').config({ override: true }); } catch (_) {}
         r = await validator.searchConstituents('health', { strict: true, nonConstituents: false });
       }
     }
 
     if (r && r.status === 200) {
-      return res.json({ success: true, data: { state: 'ok', httpStatus: r.status, keyCount, tokenExpiresAt: expIso, refreshed } });
+      return res.json({ success: true, data: { state: 'ok', httpStatus: r.status, keyCount, tokenExpiresAt: expIso, ttlSec, refreshed, lastRefresh: SKY_REFRESH_STATE } });
     }
-    return res.json({ success: true, data: { state: 'unauthorized', httpStatus: r ? r.status : null, keyCount, tokenExpiresAt: expIso, refreshed } });
+    return res.json({ success: true, data: { state: 'unauthorized', httpStatus: r ? r.status : null, keyCount, tokenExpiresAt: expIso, ttlSec, refreshed, lastRefresh: SKY_REFRESH_STATE } });
   } catch (e) {
     console.error('sky-status error:', e);
     return res.status(500).json({ success: false, message: 'Failed to check SKY status' });
   }
 });
+
+// Manual SKY refresh (internal/JWT)
+app.get('/sky-refresh', skyRefreshLimiter, verifyInternalOrJWT, async (req, res) => {
+  try {
+    const force = String(req.query.force || '').toLowerCase() === '1';
+    const beforeTtl = skyTokenTtlSeconds();
+    const skew = SKY_REFRESH_SKEW_SECONDS;
+    if (!force && beforeTtl != null && beforeTtl > skew) {
+      return res.json({ success: true, message: 'Refresh not needed yet', data: { refreshed: false, ttlSec: beforeTtl, tokenExpiresAt: decodeJwtExpIso(process.env.SKY_ACCESS_TOKEN || '') } });
+    }
+
+    if (SKY_REFRESH_STATE.refreshing) {
+      return res.status(202).json({ success: true, message: 'Refresh already in progress', data: { refreshing: true } });
+    }
+
+    SKY_REFRESH_STATE.refreshing = true;
+    SKY_REFRESH_STATE.lastAttempt = new Date().toISOString();
+    const rf = await runSkyRefresh();
+    SKY_REFRESH_STATE.refreshing = false;
+    SKY_REFRESH_STATE.lastResult = Object.assign({ at: new Date().toISOString() }, rf);
+    if (!(rf && rf.ok)) {
+      SKY_REFRESH_STATE.failCount = (SKY_REFRESH_STATE.failCount || 0) + 1;
+      log('warn', 'sky.refresh.fail', { code: rf && rf.code, err: rf && rf.err });
+      return res.status(502).json({ success: false, message: 'Refresh failed', data: { code: rf && rf.code, err: rf && rf.err } });
+    }
+    SKY_REFRESH_STATE.failCount = 0;
+    const afterTtl = skyTokenTtlSeconds();
+    log('info', 'sky.refresh.success', { ttlSec: afterTtl, expiresAt: decodeJwtExpIso(process.env.SKY_ACCESS_TOKEN || '') });
+    return res.json({ success: true, message: 'Refreshed', data: { refreshed: true, ttlSec: afterTtl, tokenExpiresAt: decodeJwtExpIso(process.env.SKY_ACCESS_TOKEN || '') } });
+  } catch (e) {
+    log('error', 'sky.refresh.exception', { message: e.message });
+    return res.status(500).json({ success: false, message: 'Refresh exception' });
+  }
+});
+
+// Background scheduler: proactively refresh near expiry
+async function _skyRefreshTick() {
+  try {
+    const ttl = skyTokenTtlSeconds();
+    log('debug', 'sky.refresh.check', { ttlSec: ttl });
+    const need = (ttl == null) || (ttl <= SKY_REFRESH_SKEW_SECONDS);
+    if (!need) return;
+    if (SKY_REFRESH_STATE.refreshing) return;
+    SKY_REFRESH_STATE.refreshing = true;
+    SKY_REFRESH_STATE.lastAttempt = new Date().toISOString();
+    const rf = await runSkyRefresh();
+    SKY_REFRESH_STATE.refreshing = false;
+    SKY_REFRESH_STATE.lastResult = Object.assign({ at: new Date().toISOString() }, rf);
+    if (!(rf && rf.ok)) {
+      SKY_REFRESH_STATE.failCount = (SKY_REFRESH_STATE.failCount || 0) + 1;
+      log('warn', 'sky.refresh.fail', { code: rf && rf.code, err: rf && rf.err });
+      return;
+    }
+    SKY_REFRESH_STATE.failCount = 0;
+    const afterTtl = skyTokenTtlSeconds();
+    log('info', 'sky.refresh.success', { ttlSec: afterTtl, expiresAt: decodeJwtExpIso(process.env.SKY_ACCESS_TOKEN || '') });
+  } catch (e) {
+    log('error', 'sky.refresh.exception', { message: e.message });
+  }
+}
+let SKY_REFRESH_TIMER = null;
+function scheduleNextSkyRefreshCheck(reason = 'schedule') {
+  try {
+    if (String(process.env.NODE_ENV || '').toLowerCase() === 'test') return; // no timers during tests
+    if (SKY_REFRESH_TIMER) { try { clearTimeout(SKY_REFRESH_TIMER); } catch (_) {} SKY_REFRESH_TIMER = null; }
+    const ttl = skyTokenTtlSeconds();
+    // If token missing/unknown -> refresh now (tick), then schedule again (done inside tick)
+    if (ttl == null) {
+      _skyRefreshTick().finally(() => {
+        // fallback: schedule a short re-check in case refresh failed
+        SKY_REFRESH_TIMER = setTimeout(() => scheduleNextSkyRefreshCheck('fallback_unknown'), Math.min(SKY_REFRESH_CHECK_INTERVAL_MS, 5 * 60 * 1000));
+      });
+      return;
+    }
+    if (ttl <= SKY_REFRESH_SKEW_SECONDS) {
+      _skyRefreshTick().finally(() => scheduleNextSkyRefreshCheck('post_tick'));
+      return;
+    }
+    const delayMs = Math.max(1000, (ttl - SKY_REFRESH_SKEW_SECONDS) * 1000);
+    SKY_REFRESH_TIMER = setTimeout(() => _skyRefreshTick().finally(() => scheduleNextSkyRefreshCheck('post_tick')), delayMs);
+    log('debug', 'sky.refresh.scheduled', { inMs: delayMs, reason });
+  } catch (e) {
+    log('warn', 'sky.refresh.schedule_error', { message: e.message });
+  }
+}
+if (String(process.env.NODE_ENV || '').toLowerCase() !== 'test') {
+  // initial schedule shortly after startup
+  setTimeout(() => scheduleNextSkyRefreshCheck('startup'), 1500);
+}
 
 // Reconcile statuses: promote representative + startup when conditions met
 app.post('/reconcile-status/:token', verifyToken, async (req, res) => {
@@ -1725,7 +1895,6 @@ async function runMemberValidationsSequential(members, { updateAirtable = true, 
       if ((result && result.raw && (result.raw.statusCode === 401 || result.raw.status === 401)) || /401/.test(String(result?.reason || ''))) {
         const rf = await runSkyRefresh();
         if (rf && rf.ok) {
-          try { require('dotenv').config({ override: true }); } catch (_) {}
           result = await validator.validateDiscount({ search_id, expected_bucket: expected, email, name, dob }, { debug: false });
         }
       }
@@ -2410,11 +2579,13 @@ function generateTeamMemberCard(member, token) {
     </div>`;
 }
 
-// Start server
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`?? UTS Startup Portal running on 0.0.0.0:${PORT}`);
-  console.log(`Environment: ${process.env.NODE_ENV || "development"}`);
-});
+// Start server only when run directly (not during tests)
+if (require.main === module) {
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`?? UTS Startup Portal running on 0.0.0.0:${PORT}`);
+    console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
+  });
+}
 
 module.exports = app;
 
