@@ -1,4 +1,4 @@
-﻿﻿const express = require("express");
+const express = require("express");
 const Airtable = require("airtable");
 const jwt = require("jsonwebtoken");
 const crypto = require("crypto");
