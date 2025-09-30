@@ -98,6 +98,7 @@ PORT=3000
 - `Personal email*` (Email)
 - `Mobile*` (Phone number)
 - `Position at startup*` (Single line text)
+- `Representative` (Checkbox or Number; set to `1` for representatives)
 - `What is your association to UTS?*` (Single select)
 - `Team Member Status` (Single select)
 - `Startup*` (Link to UTS Startups table)
@@ -258,3 +259,9 @@ For technical support or questions:
 ---
 
 **Built with ❤️ for the UTS Startup Ecosystem** 
+
+
+Uploads:
+UTS Startups
+Agreement (attachment), Agreement Created Date (date)
+Signed Agreement (attachment), Signed Agreement Received Date (date)

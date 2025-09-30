@@ -1254,18 +1254,15 @@ app.post('/complete-onboarding', verifyToken, async (req, res) => {
 // ------------------------------
 
 const URL_TTL_SECONDS = Math.max(30, parseInt(process.env.URL_TTL_SECONDS || '3600', 10));
-const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || '').trim();
 const P12_PATH = (process.env.P12_PATH || '').trim();
 const P12_PASSPHRASE = process.env.P12_PASSPHRASE || '';
 
 const PDF_TOKENS = new Map(); // token -> { filePath, expiresAt, filename }
 
 function pdfBaseUrl(req) {
-  if (PUBLIC_BASE_URL) return PUBLIC_BASE_URL.replace(/\/$/, '');
+  const domain = (process.env.REPLIT_DEV_DOMAIN || '').trim();
+  if (domain) return `https://${domain.replace(/\/$/, '')}`;
   const env = (process.env.NODE_ENV || '').toLowerCase();
-  if (env === 'production' && process.env.REPLIT_DEV_DOMAIN) {
-    return `https://${String(process.env.REPLIT_DEV_DOMAIN).replace(/\/$/, '')}`;
-  }
   if (env !== 'production' && process.env.DEV_PUBLIC_BASE_URL) {
     return String(process.env.DEV_PUBLIC_BASE_URL).replace(/\/$/, '');
   }
@@ -1312,7 +1309,10 @@ async function buildPdfPayload({ startupRecordId, memberRecordId }) {
   }
   function isWithin12m(discount) {
     const s = String(discount || '').toLowerCase();
-    return /within the last 12 months|within.*12 months|<\s*12/.test(s);
+    if (/within the last 12 months|within.*12 months|<\s*12/.test(s)) return true;
+    // Treat current staff/students as equivalent to <12m for counting/pricing when explicit columns are absent
+    if (s.includes('current') && (s.includes('student') || s.includes('staff'))) return true;
+    return false;
   }
   function isOver12m(discount) {
     const s = String(discount || '').toLowerCase();
@@ -1407,28 +1407,29 @@ async function buildPdfPayload({ startupRecordId, memberRecordId }) {
         return { first_name, last_name };
       }).filter(Boolean);
 
-      // Membership counts (submitted members only)
+      // Membership counts (submitted members only, mutually exclusive buckets)
       const submitted = teamMemberRecords.filter(r => asOne(r.get('New onboarding form submitted')));
-      let fullCount = 0, fullDisc = 0, casualCount = 0, casualWithin = 0, casualOver = 0, dayCount = 0;
+      let fullNoDisc = 0, fullDisc = 0, casualNoDisc = 0, casualWithin = 0, casualOver = 0, dayCount = 0;
       for (const r of submitted) {
         const type = normaliseType(r.get('Membership Type'));
         const discountCat = r.get('Discount Category') || '';
         const validated = String(r.get('Discount Validated') || '').trim().toLowerCase() === 'valid';
+
         if (type === 'Full Membership') {
-          fullCount++;
           if (validated && isUTSDiscount(discountCat)) fullDisc++;
+          else fullNoDisc++;
         } else if (type === 'Casual Membership') {
-          casualCount++;
           if (validated && isWithin12m(discountCat)) casualWithin++;
           else if (validated && isOver12m(discountCat)) casualOver++;
+          else casualNoDisc++;
         } else if (type === 'Day Membership') {
           dayCount++;
         }
       }
       memberships = {
-        mem_fulltime_count: String(fullCount),
+        mem_fulltime_count: String(fullNoDisc),
         mem_fulltime_uts_discount_count: String(fullDisc),
-        mem_casual_count: String(casualCount),
+        mem_casual_count: String(casualNoDisc),
         mem_casual_uts_within_12m_count: String(casualWithin),
         mem_casual_uts_over_12m_count: String(casualOver),
         mem_day_count: String(dayCount)
@@ -1445,10 +1446,20 @@ async function buildPdfPayload({ startupRecordId, memberRecordId }) {
           let fee = Number(row.base) || 0;
           const discountCat = r.get('Discount Category') || '';
           const validated = String(r.get('Discount Validated') || '').trim().toLowerCase() === 'valid';
-          const col = discountColumnFor(discountCat);
-          if (validated && col && row.discounts && row.discounts[col] != null) {
-            const val = Number(row.discounts[col]) || fee;
-            fee = val;
+          let col = discountColumnFor(discountCat);
+          if (validated && row.discounts) {
+            let rate = (col && row.discounts[col] != null) ? row.discounts[col] : null;
+            // Fallback: if table lacks explicit 'Current' columns, use '< 12m' rate for current staff/students
+            if (rate == null && (col === 'Current UTS Student' || col === 'Current Staff')) {
+              if (row.discounts['UTS Alumni < 12m'] != null) {
+                col = 'UTS Alumni < 12m';
+                rate = row.discounts[col];
+              }
+            }
+            if (rate != null) {
+              const val = Number(rate);
+              if (!Number.isNaN(val)) fee = val;
+            }
           }
           sum += fee;
         }
@@ -1972,6 +1983,142 @@ app.get('/attachments-health/:token', verifyToken, async (req, res) => {
   }
 });
 
+// Read-only pricing preview (dev/support). Mirrors buildPdfPayload pricing logic.
+app.get('/pricing-preview/:token', verifyToken, async (req, res) => {
+  try {
+    // Resolve startup record id and name
+    let startupRecordId = getStartupRecordIdFromReqUser(req);
+    if (!startupRecordId) startupRecordId = await resolveStartupRecordIdFromEOI(req.user?.startupId);
+    if (!startupRecordId) return res.status(400).json({ success: false, message: 'No linked UTS Startups record found for this token.' });
+
+    let startupName = '';
+    try {
+      const srec = await airtableBase(process.env.UTS_STARTUPS_TABLE_ID).find(startupRecordId);
+      startupName = srec.get('Startup Name (or working title)') || '';
+    } catch (_) {}
+
+    // Fetch team members by name (same as buildPdfPayload)
+    const teamMemberRecords = await airtableBase(process.env.TEAM_MEMBERS_TABLE_ID).select({
+      filterByFormula: '{Startup*} = "' + startupName + '"'
+    }).firstPage();
+
+    // Local helpers (mirror buildPdfPayload)
+    function normaliseType(raw) {
+      const s = String(raw || '').trim().toLowerCase();
+      if (s.includes('full')) return 'Full Membership';
+      if (s.includes('casual')) return 'Casual Membership';
+      if (s.includes('day')) return 'Day Membership';
+      return 'Casual Membership';
+    }
+    function discountColumnFor(category) {
+      const s = String(category || '').toLowerCase();
+      if (s.includes('current') && s.includes('student')) return 'Current UTS Student';
+      if (s.includes('current') && s.includes('staff')) return 'Current Staff';
+      if ((s.includes('alumni') && (s.includes('within') || s.includes('< 12'))) || /<\s*12/.test(s)) return 'UTS Alumni < 12m';
+      if ((s.includes('alumni') && (s.includes('more than') || s.includes('over') || s.includes('> 12'))) || />\s*12/.test(s)) return 'UTS Alumni > 12m';
+      if (s.includes('former') && s.includes('staff') && (s.includes('within') || s.includes('< 12'))) return 'Former Staff < 12m';
+      if (s.includes('former') && s.includes('staff') && (s.includes('more than') || s.includes('over') || s.includes('> 12'))) return 'Former Staff > 12m';
+      return null;
+    }
+
+    async function loadPricingMatrixViaSDK() {
+      const out = {};
+      const tableId = process.env.AIRTABLE_PRICING_TABLEID;
+      if (!tableId) return out;
+      try {
+        const records = await airtableBase(tableId).select({ pageSize: 100 }).all();
+        for (const r of records) {
+          const f = r.fields || {};
+          const typeRaw = f['Membership Type'];
+          if (!typeRaw) continue;
+          const type = normaliseType(typeRaw);
+          const baseRate = Number(String(f['Base Rate'] || '').replace(/[^0-9.\-]/g, '')) || 0;
+          out[type] = {
+            base: baseRate,
+            discounts: {
+              'Current UTS Student': Number(String(f['Current UTS Student'] || '').replace(/[^0-9.\-]/g, '')) || 0,
+              'UTS Alumni < 12m': Number(String(f['UTS Alumni < 12m'] || '').replace(/[^0-9.\-]/g, '')) || 0,
+              'UTS Alumni > 12m': Number(String(f['UTS Alumni > 12m'] || '').replace(/[^0-9.\-]/g, '')) || 0,
+              'Current Staff': Number(String(f['Current Staff'] || '').replace(/[^0-9.\-]/g, '')) || 0,
+              'Former Staff < 12m': Number(String(f['Former Staff < 12m'] || '').replace(/[^0-9.\-]/g, '')) || 0,
+              'Former Staff > 12m': Number(String(f['Former Staff > 12m'] || '').replace(/[^0-9.\-]/g, '')) || 0,
+            }
+          };
+        }
+      } catch (e) {
+        log('warn', 'pricing.load.error', { message: e.message });
+      }
+      return out;
+    }
+
+    // Build preview
+    const matrix = await loadPricingMatrixViaSDK();
+    const rows = [];
+    let sum = 0;
+    for (const r of teamMemberRecords) {
+      const submitted = asOne(r.get('New onboarding form submitted'));
+      if (!submitted) continue;
+      const type = normaliseType(r.get('Membership Type'));
+      const expected = r.get('Discount Category') || '';
+      const validated = String(r.get('Discount Validated') || '').trim().toLowerCase() === 'valid';
+      const row = matrix[type] || { base: 0, discounts: {} };
+      const base = Number(row.base) || 0;
+      let chosen = base;
+      let mapped = null;
+      let applied = 'base';
+      if (validated) {
+        mapped = discountColumnFor(expected);
+        if (mapped && row.discounts && row.discounts[mapped] != null) {
+          const val = Number(row.discounts[mapped]) || chosen;
+          chosen = val;
+          applied = mapped;
+        }
+      }
+      sum += chosen;
+      rows.push({
+        id: r.id,
+        name: r.get('Team member ID') || r.get('Name') || r.id,
+        type,
+        discountCategory: expected,
+        validated,
+        mappedColumn: mapped,
+        base,
+        appliedRate: chosen,
+        appliedFrom: applied
+      });
+    }
+
+    return res.json({ success: true, data: { startupRecordId, pricingTableId: process.env.AIRTABLE_PRICING_TABLEID || null, matrixLoaded: Object.keys(matrix).length > 0, members: rows, sum } });
+  } catch (e) {
+    return res.status(500).json({ success: false, message: 'Failed to compute pricing preview', reason: e?.message });
+  }
+});
+
+// Return the exact PDF payload used for generation (dev/support)
+app.get('/pdf-payload/:token', verifyToken, async (req, res) => {
+  try {
+    let startupRecordId = getStartupRecordIdFromReqUser(req);
+    if (!startupRecordId) startupRecordId = await resolveStartupRecordIdFromEOI(req.user?.startupId);
+    if (!startupRecordId) return res.status(400).json({ success: false, message: 'No linked UTS Startups record found for this token.' });
+
+    const payload = await buildPdfPayload({ startupRecordId });
+    return res.json({ success: true, data: payload });
+  } catch (e) {
+    return res.status(500).json({ success: false, message: 'Failed to build PDF payload', reason: e?.message });
+  }
+});
+
+// Internal: fetch payload by explicit startupRecordId (requires X-Auth-Token)
+app.get('/pdf-payload', verifyInternalOrJWT, async (req, res) => {
+  try {
+    const startupRecordId = (req.query && req.query.startupRecordId) ? String(req.query.startupRecordId) : null;
+    if (!startupRecordId) return res.status(400).json({ success: false, message: 'startupRecordId is required' });
+    const payload = await buildPdfPayload({ startupRecordId });
+    return res.json({ success: true, data: payload });
+  } catch (e) {
+    return res.status(500).json({ success: false, message: 'Failed to build PDF payload', reason: e?.message });
+  }
+});
 // ------------------------------
 // Signed agreement upload (JWT + multipart)
 // ------------------------------
