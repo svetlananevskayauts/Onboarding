@@ -91,7 +91,7 @@ function initializeForm() {
                     'Please check your email for the access link.');
                 
                 // In development, show the magic link
-                if (data.magicLink && window.location.hostname === 'localhost') {
+                if (data.magicLink && (window.location.hostname === 'localhost' || data.devMode === true)) {
                     setTimeout(() => {
                         showMagicLinkModal(data.magicLink);
                     }, 2000);
@@ -215,12 +215,23 @@ function showAlert(type, title, text = '') {
 }
 
 function showMagicLinkModal(magicLink) {
+    // Always present a local dashboard link in dev popup
+    let localLink = magicLink;
+    try {
+        const u = new URL(magicLink, window.location.origin);
+        const parts = (u.pathname || '').split('/').filter(Boolean);
+        const token = parts[parts.length - 1] || '';
+        localLink = `${window.location.origin.replace(/\/$/, '')}/dashboard/${token}`;
+    } catch (e) {
+        // Fallback to origin if parsing fails
+        localLink = `${window.location.origin.replace(/\/$/, '')}/dashboard/${String(magicLink).split('/').pop()}`;
+    }
     Swal.fire({
         title: 'Development Mode',
         html: `
             <p style="margin-bottom: 20px;">In production, this link would be sent to your email.</p>
             <p style="margin-bottom: 20px;">For development, you can access your dashboard directly:</p>
-            <a href="${magicLink}" 
+            <a href="${localLink}" 
                style="display: inline-block; background: linear-gradient(135deg, #f59e0b 0%, #ef4444 100%); 
                       color: white; padding: 12px 24px; border-radius: 12px; text-decoration: none; 
                       font-weight: 600; transition: transform 0.2s;"

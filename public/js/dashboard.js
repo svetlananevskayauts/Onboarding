@@ -1,4 +1,4 @@
-// Dashboard JavaScript
+﻿// Dashboard JavaScript
 document.addEventListener('DOMContentLoaded', function() {
     // Initialize dashboard
     initializeOnboardingFlow();
@@ -131,11 +131,12 @@ async function toggleStep(stepNumber) {
         return;
     }
 
-        // Load the form with the fetched URL
+        // Load the form with the fetched URL (augment representative form with prefill)
+        const iframeSrc = augmentFormUrl(formType, data.formUrl);
         stepContent.innerHTML = `
             <div class="form-embed-container">
                 <iframe 
-                    src="${data.formUrl}"
+                    src="${iframeSrc}"
                     class="airtable-embed ${formType}-form"
                     frameborder="0"
                     onmousewheel=""
@@ -672,17 +673,31 @@ function loadForm(button) {
 function setupFormCompletionDetection(iframe, formType) {
     // Listen for messages from iframe (if Airtable supports postMessage)
     window.addEventListener('message', function(event) {
-        if (event.origin === 'https://airtable.com' && event.data.type === 'form_submitted') {
-            markStepAsCompleted(formType);
-        }
+        try {
+            const originOk = /(^https?:\/\/([^\.]+\.)*airtable\.com$)/i.test(event.origin || '');
+            const type = (event && event.data && (event.data.type || event.data.event || event.data.action)) || '';
+            const raw = typeof event.data === 'string' ? event.data : '';
+            const looksSubmitted = /submitted|form_submitted|form-submit|complete/i.test(String(type)) || /submitted|complete/i.test(raw);
+            if (originOk && looksSubmitted) {
+                markStepAsCompleted(formType);
+                if (formType === 'representative') {
+                    try { fetch(`/ensure-representative-position/${window.dashboardData.token}`, { method: 'POST' }); } catch (_) {}
+                }
+            }
+        } catch (_) {}
     });
 
     // Fallback: Check for URL changes or form elements
     // This is a simplified approach - in production you might use Airtable webhooks
-    setTimeout(() => {
-        // Simulate completion detection after some time
-        // In real implementation, you'd check actual form submission
-    }, 5000);
+    // Fallback: ping server after a short delay in case postMessage doesn't arrive
+    if (formType === 'representative') {
+        setTimeout(() => {
+            try { fetch(`/ensure-representative-position/${window.dashboardData.token}`, { method: 'POST' }); } catch (_) {}
+        }, 10000);
+        setTimeout(() => {
+            try { fetch(`/ensure-representative-position/${window.dashboardData.token}`, { method: 'POST' }); } catch (_) {}
+        }, 30000);
+    }
 }
 
 function markStepAsCompleted(formType) {
@@ -792,6 +807,15 @@ async function confirmSubmission() {
             // Show success notification
             showNotification('success', 'Submission confirmed successfully!');
 
+            // Reconcile statuses on the server (promote representative + startup if conditions met)
+            try {
+                await fetch(`/reconcile-status/${window.dashboardData.token}`, { method: 'POST' });
+            } catch (_) {}
+
+            // Navigate to Validation & Agreement page
+            window.location.href = `/agreement/${window.dashboardData.token}`;
+            return;
+
             // Keep success state for 3 seconds, then restore
             setTimeout(() => {
                 button.innerHTML = originalText;
@@ -831,6 +855,80 @@ function showNotification(type, message) {
         background: '#1e293b',
         color: '#f8fafc'
     });
+}
+
+// Background job polling for agreement generation
+let agreementPoller = null;
+let agreementToastShown = false;
+
+function showGeneratingAgreementToast() {
+    if (agreementToastShown) return;
+    agreementToastShown = true;
+    Swal.fire({
+        icon: 'info',
+        title: 'Generating agreementâ€¦',
+        text: 'Running member validation and building your PDF.',
+        toast: true,
+        position: 'top-end',
+        showConfirmButton: false,
+        timer: 4000,
+        timerProgressBar: true,
+        background: '#1e293b',
+        color: '#f8fafc'
+    });
+}
+
+function showAgreementReady(url, filename) {
+    Swal.fire({
+        icon: 'success',
+        title: 'Agreement Ready',
+        html: `<p>Your agreement has been generated.</p>
+               <a href="${url}" target="_blank" style="display:inline-block;padding:10px 16px;border-radius:8px;background:var(--gradient-success);color:#fff;text-decoration:none;font-weight:600;">Download ${filename || 'Agreement'}</a>`,
+        confirmButtonColor: '#6366f1',
+        background: '#1e293b',
+        color: '#f8fafc'
+    });
+}
+
+async function checkAgreementJobOnce() {
+    try {
+        const resp = await fetch(`/job-status/${window.dashboardData.token}`);
+        const data = await resp.json();
+        if (!data || !data.success) return false;
+        const job = data.job || {};
+        if (job.state === 'done' && job.result && job.result.pdf && job.result.pdf.url) {
+            clearInterval(agreementPoller);
+            agreementPoller = null;
+            showAgreementReady(job.result.pdf.url, job.result.pdf.filename);
+            return true;
+        }
+        if (job.state === 'error' || job.state === 'blocked') {
+            clearInterval(agreementPoller);
+            agreementPoller = null;
+            const reason = job?.result?.reason || job?.result?.message || 'Validation/generation failed';
+            showNotification('error', reason);
+            return true;
+        }
+    } catch (e) {
+        // ignore
+    }
+    return false;
+}
+
+function startAgreementPoller() {
+    if (agreementPoller) return;
+    // quick first check, then every 3s up to 3 minutes
+    let attempts = 0;
+    const maxAttempts = 60; // 60 * 3s = 180s
+    checkAgreementJobOnce();
+    agreementPoller = setInterval(async () => {
+        attempts += 1;
+        const done = await checkAgreementJobOnce();
+        if (done || attempts >= maxAttempts) {
+            clearInterval(agreementPoller);
+            agreementPoller = null;
+        }
+    }, 3000);
 }
 
 // Add dynamic CSS for enhanced interactions
@@ -924,3 +1022,34 @@ style.textContent = `
 `;
 
 document.head.appendChild(style); 
+
+// Ensure critical prefill parameters are present for the representative form
+function augmentFormUrl(formType, url) {
+  try {
+    if (!url) return url;
+    if (formType !== 'representative') return url;
+
+    const u = new URL(url);
+    const p = u.searchParams;
+
+    // Airtable form prefill uses keys like `prefill_Field Name`.
+    // Canonical representative indicator: `Representative` (checkbox/number)
+    const prefillPairs = [
+      ['prefill_Representative', '1']
+    ];
+
+    for (const [k, v] of prefillPairs) {
+      if (!p.has(k)) p.set(k, v);
+    }
+
+    const out = u.toString();
+    try { console.debug('Representative form URL (augmented):', out); } catch (_) {}
+    return out;
+  } catch (e) {
+    try { console.warn('augmentFormUrl failed; using original URL', e?.message || e); } catch (_) {}
+    return url;
+  }
+}
+
+
+
