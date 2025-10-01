@@ -18,7 +18,10 @@ function initializeActionButtons() {
     // Add Another Team Member button
     const addTeamMemberBtn = document.querySelector('.add-team-member-btn');
     if (addTeamMemberBtn) {
-        addTeamMemberBtn.addEventListener('click', addAnotherTeamMember);
+        addTeamMemberBtn.addEventListener('click', () => {
+            // Defer enforcement to server endpoints; no client-side lock here
+            addAnotherTeamMember();
+        });
         console.log('Add Team Member button event listener attached');
     }
 
@@ -70,10 +73,39 @@ function updateHeaderDisplay(eoiName, email) {
 // Global variables for onboarding flow
 let onboardingSteps;
 let currentStep = 0; // No step active initially
+let onboardingGate = {
+  hasLinkedStartup: false,
+  startupRecordId: null,
+  representativeReady: false,
+  teamMembersReady: false
+};
+
+async function fetchOnboardingState() {
+  try {
+    const res = await fetch(`/onboarding-state/${window.dashboardData.token}`);
+    if (!res.ok) return null;
+    const json = await res.json();
+    if (!json || !json.success) return null;
+    return json.data || null;
+  } catch (_) { return null; }
+}
+
+function isStepLocked(_stepNumber) { return false; }
+
+function applyStepLocks() {
+  if (!onboardingSteps) return;
+  onboardingSteps.forEach((step, index) => {
+    const stepNumber = index + 1;
+    const locked = isStepLocked(stepNumber);
+    step.classList.toggle('locked', !!locked);
+    const header = step.querySelector('.step-header');
+    if (header) header.setAttribute('aria-disabled', locked ? 'true' : 'false');
+  });
+}
 
 async function toggleStep(stepNumber) {
-    const step = document.querySelector(`[data-step="${stepNumber}"]`);
-    if (!step) return;
+  const step = document.querySelector(`[data-step="${stepNumber}"]`);
+  if (!step) return;
 
     const isCurrentlyActive = step.classList.contains('active');
 
@@ -87,9 +119,14 @@ async function toggleStep(stepNumber) {
     // Close all other steps
     onboardingSteps.forEach(s => s.classList.remove('active'));
 
-    // Show loading state
-    const stepContent = step.querySelector('.step-content');
-    stepContent.innerHTML = '<div class="loading-state"><i class="fas fa-spinner fa-spin"></i> Loading form...</div>';
+  // Show loading state / or gated notice (fallback check; primary check happens on click)
+  const stepContent = step.querySelector('.step-content');
+  if (isStepLocked(stepNumber)) {
+    stepContent.innerHTML = '<div class="error-state"><i class="fas fa-lock"></i> This step is locked until the previous step is completed.</div>';
+    step.classList.add('active');
+    return;
+  }
+  stepContent.innerHTML = '<div class="loading-state"><i class="fas fa-spinner fa-spin"></i> Loading form...</div>';
 
     try {
         let apiEndpoint;
@@ -148,9 +185,17 @@ async function toggleStep(stepNumber) {
             </div>
         `;
 
-        // Expand the step
+    // Expand the step
     currentStep = stepNumber;
     step.classList.add('active');
+
+    // Hint-only completion detection: listen for Airtable postMessage
+    try {
+      const iframeEl = stepContent.querySelector('iframe');
+      if (iframeEl) {
+        setupFormCompletionDetection(iframeEl, formType);
+      }
+    } catch (_) {}
 
     // Smooth scroll to step
     step.scrollIntoView({ 
@@ -158,11 +203,11 @@ async function toggleStep(stepNumber) {
         block: 'center' 
     });
 
-    } catch (error) {
-        console.error('Error fetching form:', error);
-        stepContent.innerHTML = '<div class="error-state"><i class="fas fa-exclamation-triangle"></i> Failed to load form</div>';
-        step.classList.add('active');
-    }
+  } catch (error) {
+    console.error('Error fetching form:', error);
+    stepContent.innerHTML = '<div class="error-state"><i class="fas fa-exclamation-triangle"></i> Failed to load form</div>';
+    step.classList.add('active');
+  }
 }
 
 
@@ -172,12 +217,12 @@ function initializeOnboardingFlow() {
 
     // Don't initialize step states - keep all folded
 
-    // Step header click handlers
+    // Step header click handlers (defer gating to server endpoints)
     onboardingSteps.forEach((step, index) => {
-        const stepHeader = step.querySelector('.step-header');
-        stepHeader.addEventListener('click', () => {
-            toggleStep(index + 1);
-        });
+      const stepHeader = step.querySelector('.step-header');
+      stepHeader.addEventListener('click', () => {
+        toggleStep(index + 1);
+      });
     });
 
     // All steps start folded - no auto-expansion
@@ -250,6 +295,9 @@ function initializeOnboardingFlow() {
         });
     }
 }
+
+// Optional: we can fetch once on load to set initial visuals; not required for gating
+// (Left disabled to minimize API calls)
 
 // Team Member Management
 function initializeTeamManagement() {
@@ -1019,6 +1067,8 @@ style.textContent = `
     .member-avatar {
         transition: all 0.3s ease;
     }
+    .onboarding-step.locked .step-header { opacity: 0.6; cursor: not-allowed; }
+    .onboarding-step.locked .step-toggle { pointer-events: none; }
 `;
 
 document.head.appendChild(style); 

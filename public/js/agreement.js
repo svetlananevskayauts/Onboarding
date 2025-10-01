@@ -125,7 +125,7 @@ function renderMembers(tbody, members) {
 
 function statusIcon(m) {
   const s = (m.status || 'queued').toLowerCase();
-  if (s === 'valid') return '<i class="fas fa-check ok" aria-label="Valid"></i>';
+  if (s === 'valid' || s === 'skipped') return '<i class="fas fa-check ok" aria-label="Valid"></i>';
   if (s === 'invalid' || s === 'error') return '<i class="fas fa-times bad" aria-label="Invalid"></i>';
   if (s === 'ambiguous') return '<i class="fas fa-exclamation-triangle warn" aria-label="Ambiguous"></i>';
   return '<i class="fas fa-spinner fa-spin pending" aria-label="Pending"></i>';
@@ -140,4 +140,3 @@ function renderReason(m) {
   if (s === 'valid') return 'Validated';
   return '';
 }
-

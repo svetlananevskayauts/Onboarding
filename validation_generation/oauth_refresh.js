@@ -29,7 +29,8 @@ function parseEnv(text) {
 }
 
 function updateEnvAtomic(vars, cas = {}) {
-  const envPath = '.env';
+  // Allow overriding the target env file to avoid clobbering base .env in dev
+  const envPath = process.env.SKY_ENV_FILE || '.env';
   let text = '';
   try { text = fs.readFileSync(envPath, 'utf8'); } catch (_) {}
   const lines = text ? text.split(/\r?\n/) : [];

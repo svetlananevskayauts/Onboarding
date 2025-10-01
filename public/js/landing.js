@@ -76,15 +76,27 @@ function initializeForm() {
         setButtonLoading(submitBtn, true);
         
         try {
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 15000);
             const response = await fetch('/lookup-email', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
                 },
-                body: JSON.stringify({ email })
+                body: JSON.stringify({ email }),
+                signal: controller.signal
             });
+            clearTimeout(timeout);
 
-            const data = await response.json();
+            // Try JSON; if server returns text, surface it and stop spinning
+            let data;
+            const ct = response.headers.get('content-type') || '';
+            if (ct.includes('application/json')) {
+                data = await response.json();
+            } else {
+                const text = await response.text();
+                throw new Error(text || 'Unexpected non-JSON response');
+            }
 
             if (data.success) {
                 showAlert('success', 'Magic link generated successfully!', 
@@ -104,8 +116,8 @@ function initializeForm() {
             }
         } catch (error) {
             console.error('Error:', error);
-            showAlert('error', 'Connection Error', 
-                'Unable to connect to the server. Please try again.');
+            showAlert('error', 'Request Error', 
+                (error && error.message) ? String(error.message).slice(0, 300) : 'Unable to connect to the server. Please try again.');
         } finally {
             setButtonLoading(submitBtn, false);
         }

@@ -8,6 +8,13 @@ try { require("dotenv").config(); } catch (_) {}
 
 const https = require("https");
 
+function skyLog(level, event, data) {
+  try {
+    const payload = Object.assign({ ts: new Date().toISOString(), level, event }, data || {});
+    console.log(JSON.stringify(payload));
+  } catch (_) {}
+}
+
 const API_BASE = (process.env.SKY_API_BASE || "https://api.sky.blackbaud.com").trim();
 
 function parseSubscriptionKeys() {
@@ -41,7 +48,7 @@ function assertCreds() {
   }
 }
 
-async function httpGet(urlObj) {
+async function httpGet(urlObj, meta = {}) {
   const { accessToken, subscriptionKeys } = currentCreds();
 
   async function onceWithKey(subKey) {
@@ -58,10 +65,27 @@ async function httpGet(urlObj) {
         method: "GET",
         headers,
       };
+      const t0 = Date.now();
+      skyLog('info','sky.http.request', { endpoint: urlObj.pathname, method: 'GET', attempt: (meta.attempt || 1), key_index: (meta.key_index || 0), search_id: meta.search_id, id: meta.id });
       const req = https.request(opts, (res) => {
         let data = "";
         res.on("data", (c) => { data += c; });
         res.on("end", () => {
+          const dur = Date.now() - t0;
+          const status = res.statusCode;
+          let retryAfterMs = null;
+          const ra = res.headers && (res.headers['retry-after'] || res.headers['Retry-After']);
+          if (ra) {
+            const n = Number(ra);
+            if (!isNaN(n)) retryAfterMs = n * 1000;
+          }
+          if (status === 401 || status === 403) {
+            skyLog('warn','sky.auth.unauthorized', { endpoint: urlObj.pathname, status, duration_ms: dur, search_id: meta.search_id, id: meta.id });
+          } else if (status === 429) {
+            skyLog('warn','sky.rate_limited', { endpoint: urlObj.pathname, status, retry_after_ms: retryAfterMs, duration_ms: dur, search_id: meta.search_id, id: meta.id });
+          } else {
+            skyLog('info','sky.http.response', { endpoint: urlObj.pathname, status, body_size: Buffer.byteLength(data || ''), duration_ms: dur, search_id: meta.search_id, id: meta.id });
+          }
           try {
             resolve({ status: res.statusCode, json: JSON.parse(data || "{}"), headers: res.headers });
           } catch (_) {
@@ -69,7 +93,11 @@ async function httpGet(urlObj) {
           }
         });
       });
-      req.on("error", reject);
+      req.setTimeout(15000, () => { try { req.destroy(new Error('request_timeout')); } catch (_) {} });
+      req.on("error", (e) => {
+        skyLog('error','sky.http.error', { endpoint: urlObj.pathname, error: e && e.message || String(e), attempt: (meta.attempt || 1), key_index: (meta.key_index || 0), search_id: meta.search_id, id: meta.id });
+        reject(e);
+      });
       req.end();
     });
   }
@@ -78,6 +106,8 @@ async function httpGet(urlObj) {
   let last = null;
   const keys = Array.isArray(subscriptionKeys) && subscriptionKeys.length ? subscriptionKeys : [""];
   for (let i = 0; i < keys.length; i++) {
+    meta.attempt = (i + 1);
+    meta.key_index = i;
     last = await onceWithKey(keys[i]);
     if (last && last.status !== 401 && last.status !== 403) return last;
   }
@@ -98,19 +128,19 @@ async function searchConstituents(searchText, { strict = false, nonConstituents 
   if (strict) params.set("strict_search", "true");
   if (nonConstituents === false) params.set("include_non_constituents", "false");
   const url = new URL("/constituent/v1/constituents/search?" + params.toString(), API_BASE);
-  return httpGet(url);
+  return httpGet(url, { search_id: searchText });
 }
 
 async function getConstituentCodes(id) {
   assertCreds();
   const url = new URL(`/constituent/v1/constituents/${encodeURIComponent(id)}/constituentcodes`, API_BASE);
-  return httpGet(url);
+  return httpGet(url, { id });
 }
 
 async function getConstituentById(id) {
   assertCreds();
   const url = new URL(`/constituent/v1/constituents/${encodeURIComponent(id)}`, API_BASE);
-  return httpGet(url);
+  return httpGet(url, { id });
 }
 
 function monthsBetween(a, b) {
@@ -305,6 +335,7 @@ async function validateDiscount({ search_id, expected_bucket, email, name, dob }
   const trace = debug ? { input: { search_id, expected_bucket, email, name, dob }, steps: {} } : null;
 
   const sanitized = sanitizeId(search_id);
+  skyLog('info','sky.validateDiscount.start', { search_id: sanitized, expected_bucket, hasEmail: !!email, hasDOB: !!dob });
   const sr = await searchConstituents(sanitized, { strict: true, nonConstituents: false });
   if (debug) trace.steps.search = { status: sr.status, count: Array.isArray(sr.json?.value) ? sr.json.value.length : 0 };
   if (sr.status !== 200) {
