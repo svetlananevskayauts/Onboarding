@@ -1130,11 +1130,9 @@ app.get("/dashboard/:token", verifyToken, async (req, res) => {
     } catch (_) {
       /* ignore */
     }
-    const teamMemberRecords = await base(process.env.TEAM_MEMBERS_TABLE_ID)
-      .select({
-        filterByFormula: '{Startup*} = "' + memberFilterName + '"',
-      })
-      .firstPage();
+    const teamMemberRecords = startup.startupRecordId
+      ? await listTeamMembersByStartupId(startup.startupRecordId)
+      : [];
 
     const teamMembers = teamMemberRecords.map((record) => ({
       id: record.id,
@@ -1327,12 +1325,11 @@ app.post(
         }
       } catch (_) {}
 
-      // Fetch team members for this startup
-      const teamMemberRecords = await base(process.env.TEAM_MEMBERS_TABLE_ID)
-        .select({
-          filterByFormula: '{Startup*} = "' + startupName + '"',
-        })
-        .firstPage();
+      // Fetch team members strictly by linked Startup recordId
+      const startupRecId = (utsStartupsField && utsStartupsField[0]) || null;
+      const teamMemberRecords = startupRecId
+        ? await listTeamMembersByStartupId(startupRecId)
+        : [];
 
       let updated = 0;
 
@@ -1711,11 +1708,9 @@ app.post("/reconcile-status/:token", verifyToken, async (req, res) => {
     // Fetch Team Members linked by name (Airtable exposes linked names in the rollup field)
     let teamMemberRecords = [];
     try {
-      teamMemberRecords = await base(process.env.TEAM_MEMBERS_TABLE_ID)
-        .select({
-          filterByFormula: '{Startup*} = "' + startupNamePrimary + '"',
-        })
-        .firstPage();
+      if (startupRecordId) {
+        teamMemberRecords = await listTeamMembersByStartupId(startupRecordId);
+      }
     } catch (_) {}
 
     // Determine representative(s) using the dedicated field
@@ -1854,11 +1849,9 @@ app.get("/check-progress/:token", verifyToken, async (req, res) => {
 
     // Check Team Members table for representative submission (Representative = 1)
     try {
-      const teamMemberRecords = await base(process.env.TEAM_MEMBERS_TABLE_ID)
-        .select({
-          filterByFormula: '{Startup*} = "' + currentStartupName + '"',
-        })
-        .firstPage();
+      const teamMemberRecords = startupRecordId
+        ? await listTeamMembersByStartupId(startupRecordId)
+        : [];
 
       if (teamMemberRecords.length > 0) {
         // Check if any representative has submission status = 1
@@ -2130,11 +2123,7 @@ async function buildPdfPayload({ startupRecordId, memberRecordId }) {
   let calculatedMonthlyFee = "";
   if (startupName) {
     try {
-      const teamMemberRecords = await base(process.env.TEAM_MEMBERS_TABLE_ID)
-        .select({
-          filterByFormula: '{Startup*} = "' + startupName + '"',
-        })
-        .firstPage();
+      const teamMemberRecords = await listTeamMembersByStartupId(startupRecordId);
       function fullName(rec) {
         const nameField =
           rec.get("Name") || rec.get("Full name") || rec.get("Full Name") || "";
@@ -2447,16 +2436,29 @@ async function resolveStartupRecordIdFromEOI(startupId) {
   return null;
 }
 
+// Fetch Team Members strictly by linked Startup record ID (avoid name-based cross matches)
+async function listTeamMembersByStartupId(startupRecordId) {
+  if (!startupRecordId) return [];
+  const all = await base(process.env.TEAM_MEMBERS_TABLE_ID)
+    .select({ pageSize: 100 })
+    .all();
+  const isLinked = (rec) => {
+    // Prioritise common linked field names; values from linked fields are arrays of record IDs
+    const candidates = [rec.get('Startup*'), rec.get('Startup'), rec.get('UTS Startups')];
+    for (const v of candidates) {
+      if (Array.isArray(v) && v.some((x) => String(x) === String(startupRecordId))) return true;
+    }
+    return false;
+  };
+  return all.filter(isLinked);
+}
+
 async function fetchStartupAndMembers(startupRecordId) {
   const startupRec = await airtableBase(process.env.UTS_STARTUPS_TABLE_ID).find(
     startupRecordId,
   );
   const startupName = startupRec.get("Startup Name (or working title)");
-  const members = await base(process.env.TEAM_MEMBERS_TABLE_ID)
-    .select({
-      filterByFormula: '{Startup*} = "' + startupName + '"',
-    })
-    .firstPage();
+  const members = await listTeamMembersByStartupId(startupRecordId);
   return { startupRec, startupName, members };
 }
 
@@ -3138,14 +3140,8 @@ app.get("/pricing-preview/:token", verifyToken, async (req, res) => {
       startupName = srec.get("Startup Name (or working title)") || "";
     } catch (_) {}
 
-    // Fetch team members by name (same as buildPdfPayload)
-    const teamMemberRecords = await airtableBase(
-      process.env.TEAM_MEMBERS_TABLE_ID,
-    )
-      .select({
-        filterByFormula: '{Startup*} = "' + startupName + '"',
-      })
-      .firstPage();
+    // Fetch team members strictly by linked Startup recordId (same as buildPdfPayload)
+    const teamMemberRecords = await listTeamMembersByStartupId(startupRecordId);
 
     // Local helpers (mirror buildPdfPayload)
     function normaliseType(raw) {
