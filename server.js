@@ -28,19 +28,20 @@ const DEV_MODE =
   String(process.env.NODE_ENV || "").toLowerCase() === "development";
 
 // Admin Alerts (Airtable) for critical operational issues
-const ADMIN_ALERTS_TABLE_ID = process.env.ADMIN_ALERTS_TABLE_ID || 'tblWd85LhYxtHUXDf';
+const ADMIN_ALERTS_TABLE_ID =
+  process.env.ADMIN_ALERTS_TABLE_ID || "tblWd85LhYxtHUXDf";
 async function createAdminAlert(type, notes) {
   try {
     if (!ADMIN_ALERTS_TABLE_ID) return { skipped: true };
     await base(ADMIN_ALERTS_TABLE_ID).create({
-      Type: String(type || ''),
+      Type: String(type || ""),
       Timestamp: new Date().toISOString(),
-      Notes: String(notes || '')
+      Notes: String(notes || ""),
     });
-    log('warn','admin_alert.created',{ type: String(type||'') });
+    log("warn", "admin_alert.created", { type: String(type || "") });
     return { ok: true };
   } catch (e) {
-    log('error','admin_alert.failed',{ message: e.message });
+    log("error", "admin_alert.failed", { message: e.message });
     return { error: e.message };
   }
 }
@@ -134,9 +135,15 @@ function redact(obj) {
     const s = JSON.stringify(obj, (k, v) => {
       if (v == null) return v;
       const key = String(k || "").toLowerCase();
-      if (key.includes("token") || key.includes("secret") || key.includes("authorization")) return "[redacted]";
-      if (key.includes("magiclink") || key.includes("magic_link")) return "[redacted]";
-      if (typeof v === 'string') {
+      if (
+        key.includes("token") ||
+        key.includes("secret") ||
+        key.includes("authorization")
+      )
+        return "[redacted]";
+      if (key.includes("magiclink") || key.includes("magic_link"))
+        return "[redacted]";
+      if (typeof v === "string") {
         let sv = v;
         sv = sv.replace(bearerRe, (_, p1) => p1 + "[redacted]");
         sv = sv.replace(jwtLike, "[redacted]");
@@ -145,7 +152,9 @@ function redact(obj) {
       return v;
     });
     return JSON.parse(s);
-  } catch (_) { return obj; }
+  } catch (_) {
+    return obj;
+  }
 }
 function log(level, event, data, req) {
   if (!shouldLog(level)) return;
@@ -265,7 +274,7 @@ function hasDiscountRequest(expectedRaw) {
   if (!expectedRaw) return false;
   const s = String(expectedRaw).trim().toLowerCase();
   if (!s) return false;
-  return s !== 'none of the above';
+  return s !== "none of the above";
 }
 
 // Internal or JWT auth for canonical endpoints
@@ -303,10 +312,13 @@ function runSkyRefresh() {
         return resolve({ ok: true, out: out.trim() });
       }
       const payload = { ok: false, err: err.trim(), code };
-      const isInvalidGrant = (code === 10) || /invalid_grant/i.test(payload.err || '');
+      const isInvalidGrant =
+        code === 10 || /invalid_grant/i.test(payload.err || "");
       if (isInvalidGrant) {
-        const note = `Refresh failed: invalid_grant. code=${code}; stderr=${(payload.err||'').slice(0,200)}; stdout=${(out||'').slice(0,200)}`;
-        Promise.resolve(createAdminAlert('SKY Invalid Grant', note)).finally(() => resolve(payload));
+        const note = `Refresh failed: invalid_grant. code=${code}; stderr=${(payload.err || "").slice(0, 200)}; stdout=${(out || "").slice(0, 200)}`;
+        Promise.resolve(createAdminAlert("SKY Invalid Grant", note)).finally(
+          () => resolve(payload),
+        );
         return;
       }
       resolve(payload);
@@ -887,7 +899,8 @@ app.post(
       )
         .toString()
         .trim();
-      const expected =
+      // Expected discount category (preferring Manual Discount Category when manual check is present)
+      let expected =
         bodyExpected ||
         fieldStr(
           memberRec,
@@ -895,6 +908,19 @@ app.post(
             "Discount Category",
         ) ||
         "";
+      try {
+        const manualCheckField =
+          process.env.AIRTABLE_MEMBERS_MANUAL_OVERRIDE_FIELD ||
+          "Manual Discount Check";
+        const manualCategoryField =
+          process.env.AIRTABLE_MEMBERS_MANUAL_DISCOUNT_CATEGORY_FIELD ||
+          "Manual Discount Category";
+        const manualCheckVal = fieldStr(memberRec, manualCheckField);
+        if ((manualCheckVal || "").toString().trim()) {
+          const manualCat = fieldStr(memberRec, manualCategoryField);
+          if ((manualCat || "").toString().trim()) expected = manualCat;
+        }
+      } catch (_) {}
       const email =
         bodyEmail ||
         fieldStr(
@@ -919,10 +945,58 @@ app.post(
         fieldStr(memberRec, "DOB") ||
         "";
 
+      // Manual override: if the Team Member record has a non-empty
+      // 'Manual Discount Check' field (configurable), bypass SKY validation
+      // and return a deterministic skipped result. We do NOT update Airtable
+      // validation fields in this path (record is used as-is).
+      try {
+        const manualField =
+          process.env.AIRTABLE_MEMBERS_MANUAL_OVERRIDE_FIELD ||
+          "Manual Discount Check";
+        const manualVal = fieldStr(memberRec, manualField);
+        if ((manualVal || "").toString().trim()) {
+          log(
+            "info",
+            "discount_check.skip_manual_override",
+            { memberRecordId, field: manualField },
+            req,
+          );
+          const result = {
+            valid: false,
+            status: "skipped",
+            reason: "manual_override",
+          };
+          return res.json({
+            success: true,
+            data: {
+              input: { memberRecordId, search_id, expected, email, name, dob },
+              result,
+              airtableUpdate: null,
+            },
+          });
+        }
+      } catch (_) {}
+
       // Skip validation when no discount requested (expected empty or 'None of the above')
       if (!hasDiscountRequest(expected)) {
-        log('info', 'discount_check.skip_no_request', { memberRecordId, expected }, req);
-        return res.json({ success: true, data: { input: { memberRecordId, search_id, expected, email, name, dob }, result: { valid: false, status: 'skipped', reason: 'no_discount_requested' }, airtableUpdate: null } });
+        log(
+          "info",
+          "discount_check.skip_no_request",
+          { memberRecordId, expected },
+          req,
+        );
+        return res.json({
+          success: true,
+          data: {
+            input: { memberRecordId, search_id, expected, email, name, dob },
+            result: {
+              valid: false,
+              status: "skipped",
+              reason: "no_discount_requested",
+            },
+            airtableUpdate: null,
+          },
+        });
       }
 
       log(
@@ -979,14 +1053,17 @@ app.post(
         ) {
           const rf = await runSkyRefresh();
           if (rf && rf.ok) {
-          try {
-            const SKY_ENV_FILE = process.env.SKY_ENV_FILE;
-            if (SKY_ENV_FILE && fs.existsSync(SKY_ENV_FILE)) {
-              require("dotenv").config({ path: SKY_ENV_FILE, override: true });
-            } else {
-              require("dotenv").config({ override: true });
-            }
-          } catch (_) {}
+            try {
+              const SKY_ENV_FILE = process.env.SKY_ENV_FILE;
+              if (SKY_ENV_FILE && fs.existsSync(SKY_ENV_FILE)) {
+                require("dotenv").config({
+                  path: SKY_ENV_FILE,
+                  override: true,
+                });
+              } else {
+                require("dotenv").config({ override: true });
+              }
+            } catch (_) {}
             result = await validator.validateDiscount(
               { search_id, expected_bucket: expected, email, name, dob },
               { debug },
@@ -1629,27 +1706,61 @@ app.get("/sky-status", verifyInternalOrJWT, async (req, res) => {
 });
 
 // Manual SKY refresh (internal/JWT)
-app.get('/sky-refresh', skyRefreshLimiter, verifyInternalOrJWT, async (req, res) => {
-  try {
-    const force = String(req.query.force || '').toLowerCase() === '1';
-    const beforeTtl = decodeJwtExpIso(process.env.SKY_ACCESS_TOKEN || '')
-      ? (new Date(decodeJwtExpIso(process.env.SKY_ACCESS_TOKEN || '')).getTime() - Date.now())/1000
-      : null;
-    const skew = 300;
-    if (!force && beforeTtl != null && beforeTtl > skew) {
-      return res.json({ success: true, message: 'Refresh not needed yet', data: { refreshed: false, ttlSec: Math.round(beforeTtl), tokenExpiresAt: decodeJwtExpIso(process.env.SKY_ACCESS_TOKEN || '') } });
+app.get(
+  "/sky-refresh",
+  skyRefreshLimiter,
+  verifyInternalOrJWT,
+  async (req, res) => {
+    try {
+      const force = String(req.query.force || "").toLowerCase() === "1";
+      const beforeTtl = decodeJwtExpIso(process.env.SKY_ACCESS_TOKEN || "")
+        ? (new Date(
+            decodeJwtExpIso(process.env.SKY_ACCESS_TOKEN || ""),
+          ).getTime() -
+            Date.now()) /
+          1000
+        : null;
+      const skew = 300;
+      if (!force && beforeTtl != null && beforeTtl > skew) {
+        return res.json({
+          success: true,
+          message: "Refresh not needed yet",
+          data: {
+            refreshed: false,
+            ttlSec: Math.round(beforeTtl),
+            tokenExpiresAt: decodeJwtExpIso(process.env.SKY_ACCESS_TOKEN || ""),
+          },
+        });
+      }
+      const rf = await runSkyRefresh();
+      if (!(rf && rf.ok)) {
+        return res
+          .status(502)
+          .json({
+            success: false,
+            message: "Refresh failed",
+            data: { code: rf && rf.code, err: rf && rf.err },
+          });
+      }
+      const expIso = decodeJwtExpIso(process.env.SKY_ACCESS_TOKEN || "");
+      const ttlSec = expIso
+        ? Math.max(
+            0,
+            Math.round((new Date(expIso).getTime() - Date.now()) / 1000),
+          )
+        : null;
+      return res.json({
+        success: true,
+        message: "Refreshed",
+        data: { refreshed: true, ttlSec, tokenExpiresAt: expIso },
+      });
+    } catch (e) {
+      return res
+        .status(500)
+        .json({ success: false, message: "Refresh exception: " + e.message });
     }
-    const rf = await runSkyRefresh();
-    if (!(rf && rf.ok)) {
-      return res.status(502).json({ success: false, message: 'Refresh failed', data: { code: rf && rf.code, err: rf && rf.err } });
-    }
-    const expIso = decodeJwtExpIso(process.env.SKY_ACCESS_TOKEN || '');
-    const ttlSec = expIso ? Math.max(0, Math.round((new Date(expIso).getTime() - Date.now())/1000)) : null;
-    return res.json({ success: true, message: 'Refreshed', data: { refreshed: true, ttlSec, tokenExpiresAt: expIso } });
-  } catch (e) {
-    return res.status(500).json({ success: false, message: 'Refresh exception: ' + e.message });
-  }
-});
+  },
+);
 
 // Reconcile statuses: promote representative + startup when conditions met
 app.post("/reconcile-status/:token", verifyToken, async (req, res) => {
@@ -2056,6 +2167,30 @@ async function buildPdfPayload({ startupRecordId, memberRecordId }) {
     return null;
   }
 
+  // Determine effective category: use Manual Discount Category when Manual Discount Check is set
+  function effectiveDiscountCategory(rec) {
+    try {
+      const manualCheckField =
+        process.env.AIRTABLE_MEMBERS_MANUAL_OVERRIDE_FIELD ||
+        "Manual Discount Check";
+      const manualCatField =
+        process.env.AIRTABLE_MEMBERS_MANUAL_DISCOUNT_CATEGORY_FIELD ||
+        "Manual Discount Category";
+      const manualCheck = rec.get(manualCheckField) || "";
+      if (String(manualCheck).trim()) {
+        const manualCat = rec.get(manualCatField) || "";
+        if (String(manualCat).trim()) return manualCat;
+      }
+    } catch (_) {}
+    try {
+      const expectedField =
+        process.env.AIRTABLE_MEMBERS_EXPECTED_DISCOUNT_FIELD ||
+        "Discount Category";
+      return rec.get(expectedField) || "";
+    } catch (_) {}
+    return "";
+  }
+
   async function loadPricingMatrixViaSDK() {
     const out = {};
     const tableId = process.env.AIRTABLE_PRICING_TABLEID;
@@ -2123,7 +2258,8 @@ async function buildPdfPayload({ startupRecordId, memberRecordId }) {
   let calculatedMonthlyFee = "";
   if (startupName) {
     try {
-      const teamMemberRecords = await listTeamMembersByStartupId(startupRecordId);
+      const teamMemberRecords =
+        await listTeamMembersByStartupId(startupRecordId);
       function fullName(rec) {
         const nameField =
           rec.get("Name") || rec.get("Full name") || rec.get("Full Name") || "";
@@ -2166,7 +2302,7 @@ async function buildPdfPayload({ startupRecordId, memberRecordId }) {
         dayCount = 0;
       for (const r of submitted) {
         const type = normaliseType(r.get("Membership Type"));
-        const discountCat = r.get("Discount Category") || "";
+        const discountCat = effectiveDiscountCategory(r);
         const validated =
           String(r.get("Discount Validated") || "")
             .trim()
@@ -2201,7 +2337,7 @@ async function buildPdfPayload({ startupRecordId, memberRecordId }) {
           if (type === "Day Membership") continue;
           const row = matrix[type] || { base: 0, discounts: {} };
           let fee = Number(row.base) || 0;
-          const discountCat = r.get("Discount Category") || "";
+          const discountCat = effectiveDiscountCategory(r);
           const validated =
             String(r.get("Discount Validated") || "")
               .trim()
@@ -2444,9 +2580,17 @@ async function listTeamMembersByStartupId(startupRecordId) {
     .all();
   const isLinked = (rec) => {
     // Prioritise common linked field names; values from linked fields are arrays of record IDs
-    const candidates = [rec.get('Startup*'), rec.get('Startup'), rec.get('UTS Startups')];
+    const candidates = [
+      rec.get("Startup*"),
+      rec.get("Startup"),
+      rec.get("UTS Startups"),
+    ];
     for (const v of candidates) {
-      if (Array.isArray(v) && v.some((x) => String(x) === String(startupRecordId))) return true;
+      if (
+        Array.isArray(v) &&
+        v.some((x) => String(x) === String(startupRecordId))
+      )
+        return true;
     }
     return false;
   };
@@ -2499,6 +2643,8 @@ function mapReason(internal) {
     if (s === "error") return { code: "error", message: "Validation error" };
     if (s === "skipped" || s === "no_request")
       return { code: "no_request", message: "No discount requested" };
+    if (s === "manual" || s === "manual_override")
+      return { code: "manual", message: "Manual check override" };
   } catch (_) {}
   return { code: null, message: "" };
 }
@@ -2575,12 +2721,28 @@ async function runMemberValidationsSequential(
     )
       .toString()
       .trim();
-    const expected =
+    // Expected discount category with manual override support
+    let expected =
       getField(
         r,
         process.env.AIRTABLE_MEMBERS_EXPECTED_DISCOUNT_FIELD ||
           "Discount Category",
       ) || "";
+    const manual =
+      getField(
+        r,
+        process.env.AIRTABLE_MEMBERS_MANUAL_OVERRIDE_FIELD ||
+          "Manual Discount Check",
+      ) || "";
+    if (String(manual).trim()) {
+      const manualCat =
+        getField(
+          r,
+          process.env.AIRTABLE_MEMBERS_MANUAL_DISCOUNT_CATEGORY_FIELD ||
+            "Manual Discount Category",
+        ) || "";
+      if (String(manualCat).trim()) expected = manualCat;
+    }
     const email =
       getField(
         r,
@@ -2596,10 +2758,41 @@ async function runMemberValidationsSequential(
       getField(r, "DOB") ||
       "";
 
+    // Manual override present: bypass validation and keep record as-is
+    if (String(manual).trim()) {
+      if (typeof onUpdate === "function") {
+        try {
+          onUpdate(r.id, {
+            status: "skipped",
+            reason_code: "manual",
+            reason_message: "Manual check override",
+          });
+        } catch (_) {}
+      }
+      results.push({
+        memberId: r.id,
+        skipped: true,
+        reason: "manual_override",
+      });
+      continue;
+    }
+
     // Skip when no discount requested
     if (!hasDiscountRequest(expected)) {
-      if (typeof onUpdate === 'function') { try { onUpdate(r.id, { status: 'skipped', reason_code: 'no_request', reason_message: 'No discount requested' }); } catch (_) {} }
-      results.push({ memberId: r.id, skipped: true, reason: 'no_discount_requested' });
+      if (typeof onUpdate === "function") {
+        try {
+          onUpdate(r.id, {
+            status: "skipped",
+            reason_code: "no_request",
+            reason_message: "No discount requested",
+          });
+        } catch (_) {}
+      }
+      results.push({
+        memberId: r.id,
+        skipped: true,
+        reason: "no_discount_requested",
+      });
       continue;
     }
 
@@ -2779,7 +2972,30 @@ app.post(
             id: r.id,
             name: fullName(r) || r.id,
             type: r.get("Membership Type") || "",
-            expected_bucket: r.get("Discount Category") || "",
+            expected_bucket: (function () {
+              try {
+                const manualCheckField =
+                  process.env.AIRTABLE_MEMBERS_MANUAL_OVERRIDE_FIELD ||
+                  "Manual Discount Check";
+                const manualCatField =
+                  process.env.AIRTABLE_MEMBERS_MANUAL_DISCOUNT_CATEGORY_FIELD ||
+                  "Manual Discount Category";
+                const manualCheck = r.get(manualCheckField) || "";
+                if (String(manualCheck).trim()) {
+                  const manualCat = r.get(manualCatField) || "";
+                  if (String(manualCat).trim()) return manualCat;
+                }
+              } catch (_) {}
+              try {
+                return (
+                  r.get(
+                    process.env.AIRTABLE_MEMBERS_EXPECTED_DISCOUNT_FIELD ||
+                      "Discount Category",
+                  ) || ""
+                );
+              } catch (_) {}
+              return "";
+            })(),
             status: "queued",
             primary_bucket: null,
             reason: "",
@@ -2825,7 +3041,7 @@ app.post(
               if (partial.reason_code) m.reason_code = partial.reason_code;
               if (partial.reason_message)
                 m.reason_message = partial.reason_message;
-            if (
+              if (
                 ["valid", "invalid", "ambiguous", "error", "skipped"].includes(
                   String(partial.status || "").toLowerCase(),
                 )
@@ -3187,6 +3403,29 @@ app.get("/pricing-preview/:token", verifyToken, async (req, res) => {
       return null;
     }
 
+    function effectiveDiscountCategory(rec) {
+      try {
+        const manualCheckField =
+          process.env.AIRTABLE_MEMBERS_MANUAL_OVERRIDE_FIELD ||
+          "Manual Discount Check";
+        const manualCatField =
+          process.env.AIRTABLE_MEMBERS_MANUAL_DISCOUNT_CATEGORY_FIELD ||
+          "Manual Discount Category";
+        const manualCheck = rec.get(manualCheckField) || "";
+        if (String(manualCheck).trim()) {
+          const manualCat = rec.get(manualCatField) || "";
+          if (String(manualCat).trim()) return manualCat;
+        }
+      } catch (_) {}
+      try {
+        const expectedField =
+          process.env.AIRTABLE_MEMBERS_EXPECTED_DISCOUNT_FIELD ||
+          "Discount Category";
+        return rec.get(expectedField) || "";
+      } catch (_) {}
+      return "";
+    }
+
     async function loadPricingMatrixViaSDK() {
       const out = {};
       const tableId = process.env.AIRTABLE_PRICING_TABLEID;
@@ -3255,7 +3494,7 @@ app.get("/pricing-preview/:token", verifyToken, async (req, res) => {
       const submitted = asOne(r.get("New onboarding form submitted"));
       if (!submitted) continue;
       const type = normaliseType(r.get("Membership Type"));
-      const expected = r.get("Discount Category") || "";
+      const expected = effectiveDiscountCategory(r);
       const validated =
         String(r.get("Discount Validated") || "")
           .trim()
@@ -3793,9 +4032,9 @@ function generateTeamMemberCard(member, token) {
 
 // Start server only when run directly (avoid port binding during tests)
 if (require.main === module) {
-  app.listen(PORT, '0.0.0.0', () => {
+  app.listen(PORT, "0.0.0.0", () => {
     console.log(`?? UTS Startup Portal running on 0.0.0.0:${PORT}`);
-    console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
+    console.log(`Environment: ${process.env.NODE_ENV || "development"}`);
   });
 }
 
