@@ -14,7 +14,7 @@ Preferred communication style: Simple, everyday language.
 The application uses vanilla HTML, CSS, and JavaScript with a modern ES6+ approach, avoiding complex frameworks to maintain simplicity and performance. The frontend implements a component-based structure with separate CSS and JavaScript modules for landing pages and dashboard functionality. The design system follows a dark theme with custom CSS variables for consistent styling across components.
 
 ### Backend Architecture
-Built on Node.js with Express.js as the web framework, the backend follows a RESTful API pattern for handling authentication and data operations. The server implements JWT-based authentication with 15-minute token expiry for security, and includes comprehensive middleware for rate limiting, CORS, and security headers through Helmet.js.
+Built on Node.js with Express.js as the web framework, the backend follows a RESTful API pattern for handling authentication and data operations. The server implements JWT-based authentication with 90-minute token expiry for security, and includes comprehensive middleware for rate limiting, CORS, and security headers through Helmet.js.
 
 ### Authentication System
 The platform uses a passwordless authentication system based on JWT tokens delivered via magic links. This approach eliminates password management overhead while maintaining security through short-lived tokens and email verification.
@@ -24,6 +24,12 @@ Instead of a traditional database, the system integrates directly with Airtable 
 
 ### Security Implementation
 Security is implemented through multiple layers including request rate limiting, CORS configuration, Content Security Policy headers, and JWT token validation. The system includes protection against common web vulnerabilities and implements proper input validation and sanitization.
+
+**Recent Security Enhancements (October 2025):**
+- Implemented Airtable formula injection protection via escapeAirtableString() helper function
+- All user-controlled inputs (email addresses, startup names) are sanitized before database queries
+- Added comprehensive error handling for Airtable update operations
+- Fixed potential data integrity issues with startup record linking
 
 ### User Interface Design
 The frontend architecture emphasizes progressive enhancement with smooth animations, responsive design, and accessibility compliance. The interface uses a step-by-step onboarding flow with visual progress indicators and dynamic form management for adding multiple team members.

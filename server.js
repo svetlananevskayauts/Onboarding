@@ -22,7 +22,7 @@ try {
 } catch (_) {}
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 5000;
 const DEV_MODE =
   String(process.env.DEV_MODE || "").toLowerCase() === "1" ||
   String(process.env.NODE_ENV || "").toLowerCase() === "development";
