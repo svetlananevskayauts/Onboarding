@@ -363,6 +363,13 @@ async function updateMemberValidation(memberRecordId, result, expected) {
   return { ok: true, fields };
 }
 
+// Helper function to escape user input for Airtable formulas (prevent injection)
+function escapeAirtableString(str) {
+  if (!str) return '';
+  // Escape double quotes and backslashes
+  return String(str).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+}
+
 // Helper function to generate magic link
 // Now accepts optional `startupRecordId` (UTS Startups record id) to carry through the flow
 const generateMagicLink = (
@@ -507,7 +514,7 @@ app.post("/lookup-email", async (req, res) => {
       const eoiRecords = await base(process.env.UTS_EOI_TABLE_ID)
         .select({
           filterByFormula:
-            'AND({Email} = "' + email + '", {Status} = "Approved")',
+            'AND({Email} = "' + escapeAirtableString(email) + '", {Status} = "Approved")',
         })
         .firstPage();
       log(
@@ -528,7 +535,7 @@ app.post("/lookup-email", async (req, res) => {
           )
             .select({
               filterByFormula:
-                '{Startup Name (or working title)} = "' + startupName + '"',
+                '{Startup Name (or working title)} = "' + escapeAirtableString(startupName) + '"',
             })
             .firstPage();
 
@@ -670,6 +677,10 @@ app.post("/lookup-email", async (req, res) => {
               ),
               representativeFormUrl: representativeFormUrl,
               step2Unlocked: utsStartupsField && utsStartupsField.length > 0,
+              startupRecordId:
+                utsStartupsField && utsStartupsField.length > 0
+                  ? utsStartupsField[0]
+                  : null,
             };
             accessType = "onboarding";
             targetTable = process.env.UTS_EOI_TABLE_ID;
@@ -740,7 +751,7 @@ app.post("/lookup-email", async (req, res) => {
           process.env.UTS_STARTUPS_TABLE_ID,
         )
           .select({
-            filterByFormula: '{Primary contact email} = "' + email + '"',
+            filterByFormula: '{Primary contact email} = "' + escapeAirtableString(email) + '"',
           })
           .firstPage();
 
@@ -800,11 +811,19 @@ app.post("/lookup-email", async (req, res) => {
     const expiresAt = new Date(Date.now() + 90 * 60 * 1000); // 90 minutes
 
     // Update the target table with magic link
-    await base(targetTable).update(startup.id, {
-      "Magic Link": magicLink,
-      "Token Expires At": expiresAt.toISOString(),
-      Link: magicLink,
-    });
+    try {
+      await base(targetTable).update(startup.id, {
+        "Magic Link": magicLink,
+        "Token Expires At": expiresAt.toISOString(),
+        Link: magicLink,
+      });
+    } catch (updateError) {
+      log("error", "lookup_email.update_failed", { message: updateError.message }, req);
+      return res.status(500).json({
+        success: false,
+        message: "Failed to save magic link. Please try again.",
+      });
+    }
 
     // Provide different messages based on access type
     let message = "Magic link generated successfully!";
