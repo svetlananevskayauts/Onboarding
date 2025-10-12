@@ -2191,6 +2191,33 @@ async function buildPdfPayload({ startupRecordId, memberRecordId }) {
     return "";
   }
 
+  // Check if discount is validated (either via API or manual override)
+  function isDiscountValidated(rec) {
+    try {
+      const manualCheckField =
+        process.env.AIRTABLE_MEMBERS_MANUAL_OVERRIDE_FIELD ||
+        "Manual Discount Check";
+      const manualCatField =
+        process.env.AIRTABLE_MEMBERS_MANUAL_DISCOUNT_CATEGORY_FIELD ||
+        "Manual Discount Category";
+      const manualCheck = rec.get(manualCheckField) || "";
+      const manualCat = rec.get(manualCatField) || "";
+      
+      // If manual check is 'Valid' and manual category is not empty, consider validated
+      if (String(manualCheck).trim().toLowerCase() === 'valid' && String(manualCat).trim()) {
+        return true;
+      }
+    } catch (_) {}
+    
+    // Otherwise check API validation
+    try {
+      return String(rec.get("Discount Validated") || "")
+        .trim()
+        .toLowerCase() === "valid";
+    } catch (_) {}
+    return false;
+  }
+
   async function loadPricingMatrixViaSDK() {
     const out = {};
     const tableId = process.env.AIRTABLE_PRICING_TABLEID;
@@ -2303,10 +2330,7 @@ async function buildPdfPayload({ startupRecordId, memberRecordId }) {
       for (const r of submitted) {
         const type = normaliseType(r.get("Membership Type"));
         const discountCat = effectiveDiscountCategory(r);
-        const validated =
-          String(r.get("Discount Validated") || "")
-            .trim()
-            .toLowerCase() === "valid";
+        const validated = isDiscountValidated(r);
 
         if (type === "Full Membership") {
           if (validated && isUTSDiscount(discountCat)) fullDisc++;
@@ -2338,10 +2362,7 @@ async function buildPdfPayload({ startupRecordId, memberRecordId }) {
           const row = matrix[type] || { base: 0, discounts: {} };
           let fee = Number(row.base) || 0;
           const discountCat = effectiveDiscountCategory(r);
-          const validated =
-            String(r.get("Discount Validated") || "")
-              .trim()
-              .toLowerCase() === "valid";
+          const validated = isDiscountValidated(r);
           let col = discountColumnFor(discountCat);
           if (validated && row.discounts) {
             let rate =
@@ -3426,6 +3447,30 @@ app.get("/pricing-preview/:token", verifyToken, async (req, res) => {
       return "";
     }
 
+    function isDiscountValidated(rec) {
+      try {
+        const manualCheckField =
+          process.env.AIRTABLE_MEMBERS_MANUAL_OVERRIDE_FIELD ||
+          "Manual Discount Check";
+        const manualCatField =
+          process.env.AIRTABLE_MEMBERS_MANUAL_DISCOUNT_CATEGORY_FIELD ||
+          "Manual Discount Category";
+        const manualCheck = rec.get(manualCheckField) || "";
+        const manualCat = rec.get(manualCatField) || "";
+        
+        if (String(manualCheck).trim().toLowerCase() === 'valid' && String(manualCat).trim()) {
+          return true;
+        }
+      } catch (_) {}
+      
+      try {
+        return String(rec.get("Discount Validated") || "")
+          .trim()
+          .toLowerCase() === "valid";
+      } catch (_) {}
+      return false;
+    }
+
     async function loadPricingMatrixViaSDK() {
       const out = {};
       const tableId = process.env.AIRTABLE_PRICING_TABLEID;
@@ -3495,10 +3540,7 @@ app.get("/pricing-preview/:token", verifyToken, async (req, res) => {
       if (!submitted) continue;
       const type = normaliseType(r.get("Membership Type"));
       const expected = effectiveDiscountCategory(r);
-      const validated =
-        String(r.get("Discount Validated") || "")
-          .trim()
-          .toLowerCase() === "valid";
+      const validated = isDiscountValidated(r);
       const row = matrix[type] || { base: 0, discounts: {} };
       const base = Number(row.base) || 0;
       let chosen = base;
