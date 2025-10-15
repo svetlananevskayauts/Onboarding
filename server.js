@@ -4083,11 +4083,13 @@ function generateTeamMemberCard(member, token) {
                 </div>
             </div>
         </div>
+        <!-- EDIT FUNCTIONALITY COMMENTED OUT - TO REINSTATE LATER
         <div class="member-actions">
             <button class="btn btn-outline edit-member-btn" onclick="editTeamMember('${member.id}', '${token}')">
                 <i class="fas fa-edit"></i> Edit
             </button>
         </div>
+        -->
     </div>`;
 }
 
