@@ -4052,7 +4052,7 @@ function generateOnboardingFlow(startup, formUrls, token) {
                 </button>
 
                 <button class="btn btn-primary submission-confirmation-btn">
-                    <i class="fas fa-check-circle"></i> Submission Confirmation
+                    <i class="fas fa-check-circle"></i> Submit Application
                 </button>
             </div>
         </div>
