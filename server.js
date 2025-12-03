@@ -1222,6 +1222,16 @@ app.post("/lookup-email", async (req, res) => {
     const expiresAt = new Date(Date.now() + 90 * 60 * 1000); // 90 minutes
 
     // Update the target table with magic link (fire-and-forget)
+    log(
+      "info",
+      "lookup_email.update_attempt",
+      { 
+        targetTable: targetTable || "NONE",
+        startupId: startup?.id || "NONE",
+        hasBase: !!base,
+      },
+      req,
+    );
     if (targetTable) {
       Promise.resolve()
         .then(() =>
@@ -1231,14 +1241,29 @@ app.post("/lookup-email", async (req, res) => {
             Link: magicLink,
           }),
         )
+        .then(() => {
+          log(
+            "info",
+            "lookup_email.update_success",
+            { targetTable, startupId: startup.id },
+            req,
+          );
+        })
         .catch((updateError) => {
           log(
             "error",
             "lookup_email.update_failed",
-            { message: updateError.message },
+            { message: updateError.message, targetTable, startupId: startup.id },
             req,
           );
         });
+    } else {
+      log(
+        "warn",
+        "lookup_email.update_skipped",
+        { reason: "targetTable is null/undefined" },
+        req,
+      );
     }
 
     // Provide different messages based on access type
