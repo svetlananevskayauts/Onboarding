@@ -169,7 +169,8 @@ function inferBucketsFromCodes(codes, now = new Date()) {
     }
     if (desc === "staff") {
       if (!inactive) {
-        out.add("Current UTS Staff");
+        // New label: active staff are considered full time for discount purposes
+        out.add("Current UTS Staff (full time)");
       } else {
         const dt = (typeof c?.date_modified === "string" && !isNaN(new Date(c.date_modified)))
           ? new Date(c.date_modified)
@@ -177,8 +178,9 @@ function inferBucketsFromCodes(codes, now = new Date()) {
             ? new Date(c.date_added)
             : null);
         months = dt ? monthsBetween(dt, now) : null;
-        if (months != null && months <= 12 + 1e-6) out.add("Former UTS Staff (employed within the last 12 months)");
-        else out.add("Former UTS Staff (employed more than 12 months ago)");
+        // Only within-last-12-months former staff qualify. >12 months no longer qualifies and emits no bucket.
+        if (months != null && months <= 12 + 1e-6) out.add("Former UTS Staff (full time within last 12 months)");
+        // else: do not add a bucket for >12 months (non-qualifying)
       }
       continue;
     }
@@ -213,11 +215,10 @@ function alumniCommencementFromCodes(codes) {
 function choosePrimaryBucket(buckets) {
   const order = [
     "Current UTS Student",
-    "Current UTS Staff",
+    "Current UTS Staff (full time)",
     "UTS Alumni (graduated within the last 12 months)",
     "UTS Alumni (graduated more than 12 months ago)",
-    "Former UTS Staff (employed within the last 12 months)",
-    "Former UTS Staff (employed more than 12 months ago)",
+    "Former UTS Staff (full time within last 12 months)",
   ];
   for (const b of order) if (buckets.includes(b)) return b;
   return buckets[0] || null;

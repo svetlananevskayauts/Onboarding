@@ -1,4 +1,4 @@
-const express = require("express");
+﻿const express = require("express");
 const Airtable = require("airtable");
 const jwt = require("jsonwebtoken");
 const crypto = require("crypto");
@@ -23,9 +23,15 @@ try {
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+// Environment mode: treat NODE_ENV=dev or development as dev
+// Prefer explicit NODE_DEV ('dev' | 'prod'), but also accept NODE_ENV=dev
+const NODE_DEV = String(process.env.NODE_DEV || "").toLowerCase();
+const NODE_ENV_STR = String(process.env.NODE_ENV || "").toLowerCase();
 const DEV_MODE =
+  (NODE_DEV && NODE_DEV === "dev") ||
   String(process.env.DEV_MODE || "").toLowerCase() === "1" ||
-  String(process.env.NODE_ENV || "").toLowerCase() === "development";
+  NODE_ENV_STR === "development" ||
+  NODE_ENV_STR === "dev";
 
 // Admin Alerts (Airtable) for critical operational issues
 const ADMIN_ALERTS_TABLE_ID =
@@ -85,34 +91,45 @@ app.use(
   }),
 );
 
-// Rate limiting
-const limiter = rateLimit({
-  windowMs: 90 * 60 * 1000, // 90 minutes
-  max: 100, // limit each IP to 100 requests per windowMs
-  message: "Too many requests from this IP, please try again later.",
-});
+// Rate limiting (disabled in dev or when DISABLE_RATE_LIMIT=1)
+const passthrough = (_req, _res, next) => next();
+const RATE_LIMIT_DISABLED =
+  DEV_MODE || String(process.env.DISABLE_RATE_LIMIT || "").toLowerCase() === "1";
+const limiter = RATE_LIMIT_DISABLED
+  ? passthrough
+  : rateLimit({
+      windowMs: 90 * 60 * 1000, // 90 minutes
+      max: 100, // limit each IP to 100 requests per windowMs
+      message: "Too many requests from this IP, please try again later.",
+    });
 
 app.use(limiter);
 
 // Route-specific rate limiters (surgical additions)
-const discountLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 5,
-  standardHeaders: true,
-  legacyHeaders: false,
-});
-const orchestratorLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 2,
-  standardHeaders: true,
-  legacyHeaders: false,
-});
-const skyRefreshLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 2,
-  standardHeaders: true,
-  legacyHeaders: false,
-});
+const discountLimiter = RATE_LIMIT_DISABLED
+  ? passthrough
+  : rateLimit({
+      windowMs: 60 * 1000,
+      max: 5,
+      standardHeaders: true,
+      legacyHeaders: false,
+    });
+const orchestratorLimiter = RATE_LIMIT_DISABLED
+  ? passthrough
+  : rateLimit({
+      windowMs: 60 * 1000,
+      max: 2,
+      standardHeaders: true,
+      legacyHeaders: false,
+    });
+const skyRefreshLimiter = RATE_LIMIT_DISABLED
+  ? passthrough
+  : rateLimit({
+      windowMs: 60 * 1000,
+      max: 2,
+      standardHeaders: true,
+      legacyHeaders: false,
+    });
 
 // Middleware
 app.use(cors());
@@ -231,6 +248,42 @@ const base = new Airtable({ apiKey: process.env.AIRTABLE_API_KEY }).base(
 // Alias to avoid accidental shadowing of `base` in local scopes
 const airtableBase = base;
 
+// Optional secondary Airtable base (agent + transactions)
+const AGENT_BASE_ID =
+  process.env.AIRTABLE_AGENT_BASE_ID || "appRypIQ9OdR0ilGL";
+const AGENT_TEAM_MEMBERS_TABLE_ID =
+  process.env.AGENT_TEAM_MEMBERS_TABLE_ID || "tblaqviciPbDyKIZR";
+const AGENT_MEMBERSHIP_EVENTS_TABLE_ID =
+  process.env.AGENT_MEMBERSHIP_EVENTS_TABLE_ID || "tbla36dy2z5cPmVpY";
+const AGENT_CHANGE_REQUESTS_TABLE_ID =
+  process.env.AGENT_CHANGE_REQUESTS_TABLE_ID || "tbloSfeIqOZyCJrwy";
+const AGENT_MEMBERSHIP_TYPES_TABLE_ID =
+  process.env.AGENT_MEMBERSHIP_TYPES_TABLE_ID || "tblEYO4C1ybIaNoEL";
+const AGENT_MEMBERSHIP_EXPORT_TABLE_ID =
+  process.env.AGENT_MEMBERSHIP_EXPORT_TABLE_ID || "tblIj1ppIAUrN2pF0";
+const AGENT_FINANCIAL_TRANSACTIONS_TABLE_ID =
+  process.env.AGENT_FINANCIAL_TRANSACTIONS_TABLE_ID || "tbl8cyTgDN8iE7fFq";
+const AGENT_UTS_STARTUPS_TABLE_ID =
+  process.env.AGENT_UTS_STARTUPS_TABLE_ID || "tbl1Jumidao9VffEw";
+
+const FINANCIAL_TRANSACTIONS_CACHE_MS = parseInt(
+  process.env.FINANCIAL_TRANSACTIONS_CACHE_MS || "300000",
+  10,
+);
+const FINANCIAL_TRANSACTIONS_LIMIT = parseInt(
+  process.env.FINANCIAL_TRANSACTIONS_LIMIT || "200",
+  10,
+);
+const MEMBER_ROLE_FIELD =
+  process.env.AIRTABLE_MEMBERS_ROLE_FIELD || "Position at startup*";
+
+let agentBase = null;
+if (process.env.AIRTABLE_AGENT_PAT) {
+  agentBase = new Airtable({ apiKey: process.env.AIRTABLE_AGENT_PAT }).base(
+    AGENT_BASE_ID,
+  );
+}
+
 // JWT token verification middleware
 const verifyToken = (req, res, next) => {
   const token = req.params.token || req.body.token;
@@ -277,6 +330,62 @@ function hasDiscountRequest(expectedRaw) {
   return s !== "none of the above";
 }
 
+function manualOverrideInfo(rec) {
+  const info = { hasOverride: false, category: "" };
+  if (!rec || typeof rec.get !== "function") return info;
+  function readField(fieldName) {
+    if (!fieldName) return "";
+    try {
+      const raw = rec.get(fieldName);
+      if (raw == null) return "";
+      if (typeof raw === "string") return raw;
+      if (typeof raw === "number") return String(raw);
+      if (typeof raw === "boolean") return raw ? "Yes" : "No";
+      if (Array.isArray(raw)) {
+        return raw
+          .map((entry) => {
+            if (!entry) return "";
+            if (typeof entry === "string") return entry;
+            if (entry && typeof entry === "object" && entry.name) return entry.name;
+            return "";
+          })
+          .filter(Boolean)
+          .join(", ");
+      }
+      if (typeof raw === "object" && raw.name) return raw.name;
+      return String(raw);
+    } catch (_) {
+      return "";
+    }
+  }
+  const manualCategoryField =
+    process.env.AIRTABLE_MEMBERS_MANUAL_DISCOUNT_CATEGORY_FIELD ||
+    "Manual Discount Category";
+  const manualCategory = readField(manualCategoryField).trim();
+  if (!manualCategory) return info;
+  info.category = manualCategory;
+
+  const manualOverrideField =
+    process.env.AIRTABLE_MEMBERS_MANUAL_OVERRIDE_FIELD ||
+    "Manual Discount Check";
+  const manualFlag = readField(manualOverrideField).trim();
+  if (manualFlag) {
+    info.hasOverride = true;
+    return info;
+  }
+
+  const manualValidatedField =
+    process.env.AIRTABLE_MEMBERS_VALIDATED_SELECT_FIELD ||
+    "Discount Validated";
+  const validated = readField(manualValidatedField).trim().toLowerCase();
+  if (validated.includes("manual")) info.hasOverride = true;
+  return info;
+}
+
+function hasManualOverride(rec) {
+  return manualOverrideInfo(rec).hasOverride;
+}
+
 // Internal or JWT auth for canonical endpoints
 const verifyInternalOrJWT = (req, res, next) => {
   const hdr = req.get("X-Auth-Token");
@@ -286,6 +395,24 @@ const verifyInternalOrJWT = (req, res, next) => {
   if (req.body && req.body.token) return verifyToken(req, res, next);
   return res.status(401).json({ success: false, message: "Unauthorized" });
 };
+
+// DEV-only access guard for helper endpoints
+function requireDevAccess(req, res, next) {
+  if (!DEV_MODE)
+    return res
+      .status(403)
+      .json({ success: false, message: "Dev mode only endpoint" });
+  const cfg = (process.env.AUTH_TOKEN || "").trim();
+  // If an AUTH_TOKEN is configured, require it for extra safety
+  if (cfg) {
+    const hdr = req.get("X-Auth-Token");
+    if (!hdr || hdr !== cfg)
+      return res
+        .status(401)
+        .json({ success: false, message: "Missing or invalid X-Auth-Token" });
+  }
+  return next();
+}
 
 // SKY token refresh helper (spawns 56eration/oauth_refresh.js)
 function runSkyRefresh() {
@@ -427,6 +554,93 @@ app.get("/", (req, res) => {
 app.get("/healthz", (_req, res) => {
   res.json({ success: true, data: { ok: true } });
 });
+
+// DEV: quick magic-link generator for UX/testing
+// Usage: GET /dev/magic-link?startupRecordId=recXXXX | eoiId=recYYYY [&email=..&startupName=..&persist=1]
+app.get("/dev/magic-link", requireDevAccess, async (req, res) => {
+  try {
+    const { startupRecordId, eoiId, email: qEmail, startupName: qName, persist } =
+      req.query || {};
+    let mode = null;
+    let startupId = null; // token payload startupId (EOI or Startups ID)
+    let startupName = null;
+    let email = (qEmail || "").toString();
+    let startupRecordIdResolved = null;
+    let tableToUpdate = null;
+    let recordIdToUpdate = null;
+
+    if (startupRecordId) {
+      const srec = await airtableBase(process.env.UTS_STARTUPS_TABLE_ID).find(
+        String(startupRecordId),
+      );
+      startupRecordIdResolved = srec.id;
+      startupId = srec.id; // use Startups id in token (dashboard flow supports this)
+      startupName = qName || srec.get("Startup Name (or working title)") || "";
+      if (!email) email = srec.get("Primary contact email") || "";
+      mode = "management";
+      tableToUpdate = process.env.UTS_STARTUPS_TABLE_ID;
+      recordIdToUpdate = srec.id;
+    } else if (eoiId) {
+      const erec = await base(process.env.UTS_EOI_TABLE_ID).find(String(eoiId));
+      startupId = erec.id; // EOI id in token mirrors production onboarding
+      startupName =
+        qName ||
+        erec.get("Startup Name") ||
+        erec.get("EOI") ||
+        "";
+      if (!email) email = erec.get("Email") || "";
+      const utsStartups = erec.get("UTS Startups");
+      if (utsStartups && utsStartups.length > 0)
+        startupRecordIdResolved = utsStartups[0];
+      mode = "onboarding";
+      tableToUpdate = process.env.UTS_EOI_TABLE_ID;
+      recordIdToUpdate = erec.id;
+    } else {
+      return res
+        .status(400)
+        .json({ success: false, message: "Provide startupRecordId or eoiId" });
+    }
+
+    const magicLink = generateMagicLink(
+      startupId,
+      startupName,
+      email,
+      startupRecordIdResolved || null,
+    );
+    const parts = String(magicLink).split("/dashboard/");
+    const baseUrl = parts[0] || "";
+    const token = parts[1] || "";
+    const agreementLink = `${baseUrl}/agreement/${token}`;
+
+    if (String(persist || "0").toLowerCase() === "1") {
+      try {
+        const expiresAt = new Date(Date.now() + 90 * 60 * 1000).toISOString();
+        if (tableToUpdate && recordIdToUpdate) {
+          await base(tableToUpdate).update(recordIdToUpdate, {
+            "Magic Link": magicLink,
+            "Token Expires At": expiresAt,
+            Link: magicLink,
+          });
+        }
+      } catch (e) {
+        log("warn", "dev.magic_link.persist_failed", { message: e.message });
+      }
+    }
+
+    return res.json({
+      success: true,
+      mode,
+      magicLink,
+      agreementLink,
+      token,
+      devMode: DEV_MODE,
+    });
+  } catch (e) {
+    return res
+      .status(500)
+      .json({ success: false, message: e?.message || "Failed" });
+  }
+});
 // Agreement page
 app.get("/agreement/:token", verifyToken, async (req, res) => {
   try {
@@ -452,7 +666,7 @@ app.get("/agreement/:token", verifyToken, async (req, res) => {
                 <i class="fas fa-file-pdf"></i> Download Agreement
               </button>
             </a>
-            <a href="/" class="btn">Back to Home</a>
+            <a id="back-home-link" href="/" class="btn">Back to Home</a>
           </div>
           <p class="muted">We are validating your team and generating your agreement. This may take a moment.</p>
         </div>
@@ -509,14 +723,133 @@ app.post("/lookup-email", async (req, res) => {
     let accessType = null; // 'onboarding' or 'management'
     let targetTable = null;
 
-    // STEP 1: Check EOI table for approved startups, then check if they need onboarding
+    // PRIORITY A: Management access via Startups 'Representative Email'
     try {
+      const reps = await airtableBase(process.env.UTS_STARTUPS_TABLE_ID)
+        .select({
+          filterByFormula:
+            '{Representative Email} = "' + escapeAirtableString(email) + '"',
+          maxRecords: 1,
+          pageSize: 1,
+          fields: [
+            'Startup Name (or working title)',
+            'Primary contact email',
+            'Record ID',
+            'Status',
+            '03. Startup Representative Details Prefilled',
+            '04. Nominated Personnel Details',
+          ],
+        })
+        .firstPage();
+      log('debug', 'lookup_email.rep_email.count', { count: reps.length }, req);
+      if (reps.length > 0) {
+        const s = reps[0];
+        startup = {
+          id: s.id,
+          name: s.get("Startup Name (or working title)"),
+          primaryContact: s.get("Primary contact email"),
+          recordId: s.get("Record ID"),
+          status: s.get("Status"),
+          isEOIApproved: false,
+          needsOnboarding: false,
+          eoiName: s.get("Startup Name (or working title)"),
+          representativeFormUrl: s.get("03. Startup Representative Details Prefilled"),
+          teamMemberFormUrl: s.get("04. Nominated Personnel Details"),
+          startupRecordId: s.id,
+        };
+        accessType = "management";
+        targetTable = process.env.UTS_STARTUPS_TABLE_ID;
+      }
+    } catch (e) {
+      log("warn", "lookup_email.rep_email.error", { message: e.message }, req);
+    }
+
+    // PRIORITY B: If no representative match, check Team Members by Personal email*
+    if (!startup) {
+      try {
+        const hits = await base(process.env.TEAM_MEMBERS_TABLE_ID)
+          .select({
+            filterByFormula:
+              '{Personal email*} = "' + escapeAirtableString(email) + '"',
+            maxRecords: 5,
+            pageSize: 5,
+            fields: [
+              'Personal email*',
+              'Representative',
+              'New onboarding form submitted',
+              'Startup*',
+              'UTS Startups',
+            ],
+          })
+          .firstPage();
+        log('debug', 'lookup_email.team_email.count', { count: hits.length }, req);
+        if (hits.length > 0) {
+          // If the email belongs to a Team Member with Representative=1 and is linked to a Startup, promote to management
+          const repCandidate = hits.find((r) => asOne(r.get('Representative')));
+          log('debug', 'lookup_email.team_email.rep_candidate', { found: !!repCandidate }, req);
+          if (repCandidate) {
+            const linkVals =
+              repCandidate.get('Startup*') ||
+              repCandidate.get('Startup') ||
+              repCandidate.get('UTS Startups') || [];
+            const startupLinkId = Array.isArray(linkVals) && linkVals.length ? String(linkVals[0]) : null;
+            if (startupLinkId) {
+              try {
+                const s = await airtableBase(process.env.UTS_STARTUPS_TABLE_ID).find(startupLinkId);
+                log('info', 'lookup_email.teamrep.promote', { startupRecordId: startupLinkId }, req);
+                startup = {
+                  id: s.id,
+                  name: s.get('Startup Name (or working title)'),
+                  primaryContact: s.get('Primary contact email'),
+                  recordId: s.get('Record ID'),
+                  status: s.get('Status'),
+                  isEOIApproved: false,
+                  needsOnboarding: false,
+                  eoiName: s.get('Startup Name (or working title)'),
+                  representativeFormUrl: s.get('03. Startup Representative Details Prefilled'),
+                  teamMemberFormUrl: s.get('04. Nominated Personnel Details'),
+                  startupRecordId: s.id,
+                };
+                accessType = 'management';
+                targetTable = process.env.UTS_STARTUPS_TABLE_ID;
+              } catch (e) {
+                log('warn', 'lookup_email.teamrep.promote_failed', { message: e.message }, req);
+              }
+            }
+          }
+
+          // If we still haven't promoted to management, treat as non-representative
+          if (!startup) {
+            return res.status(403).json({
+              success: false,
+              message: "You are not the listed representative of a startup",
+            });
+          }
+        }
+      } catch (e) {
+        log("warn", "lookup_email.team_email.error", { message: e.message }, req);
+      }
+    }
+
+    // STEP (fallback): Check EOI table for approved startups, then check if they need onboarding
+    if (!startup) try {
       const eoiRecords = await base(process.env.UTS_EOI_TABLE_ID)
         .select({
           filterByFormula:
             'AND({Email} = "' + escapeAirtableString(email) + '", {Status} = "Approved")',
+          maxRecords: 1,
+          pageSize: 1,
+          fields: [
+            'EOI',
+            'Email',
+            'Startup Name',
+            'Status',
+            '02. Startup Onboarding Form Prefilled',
+            'UTS Startups',
+          ],
         })
         .firstPage();
+      log('debug', 'lookup_email.eoi.count', { count: eoiRecords.length }, req);
       log(
         "debug",
         "lookup_email.env",
@@ -622,7 +955,7 @@ app.post("/lookup-email", async (req, res) => {
                 name: startupRecord.get("Startup Name (or working title)"),
                 primaryContact: email,
                 recordId: startupRecord.get("Record ID"),
-                status: startupRecord.get("Startup status"),
+                status: startupRecord.get("Status"),
                 isEOIApproved: false,
                 needsOnboarding: false,
                 eoiName: startupRecord.get("Startup Name (or working title)"),
@@ -743,17 +1076,27 @@ app.post("/lookup-email", async (req, res) => {
       log("warn", "lookup_email.eoi.error", { message: error.message }, req);
     }
 
-    // STEP 2: If not onboarding, check UTS Startups table for management
+    // STEP 2 (redundant safety): If still unmatched, check Startups again by Representative Email
     console.log("DEBUG: Checking management path, startup is null:", !startup);
     if (!startup) {
       try {
-        const startupRecords = await airtableBase(
-          process.env.UTS_STARTUPS_TABLE_ID,
-        )
-          .select({
-            filterByFormula: '{Primary contact email} = "' + escapeAirtableString(email) + '"',
-          })
-          .firstPage();
+          const startupRecords = await airtableBase(
+            process.env.UTS_STARTUPS_TABLE_ID,
+          )
+            .select({
+              filterByFormula:
+              '{Representative Email} = "' + escapeAirtableString(email) + '"',
+              maxRecords: 1,
+              pageSize: 1,
+              fields: [
+                'Startup Name (or working title)',
+                'Primary contact email',
+                'Record ID',
+                'Status',
+                '03. Startup Representative Details Prefilled',
+              ],
+            })
+            .firstPage();
 
         console.log(
           "DEBUG: Found startup records in management path:",
@@ -766,7 +1109,7 @@ app.post("/lookup-email", async (req, res) => {
             name: startupRecord.get("Startup Name (or working title)"),
             primaryContact: email,
             recordId: startupRecord.get("Record ID"),
-            status: startupRecord.get("Startup status"),
+            status: startupRecord.get("Status"),
             isEOIApproved: false,
             needsOnboarding: false,
             eoiName: startupRecord.get("Startup Name (or working title)"),
@@ -775,10 +1118,7 @@ app.post("/lookup-email", async (req, res) => {
             ),
             startupRecordId: startupRecord.id,
           };
-          console.log(
-            "Management path - representativeFormUrl from Airtable:",
-            startupRecord.get("03. Startup Representative Details Prefilled"),
-          );
+          // Management via representative email
           accessType = "management";
           targetTable = process.env.UTS_STARTUPS_TABLE_ID;
         }
@@ -793,6 +1133,77 @@ app.post("/lookup-email", async (req, res) => {
         message:
           "Email not found in our system. Please ensure you have submitted an EOI and it has been approved, or you are the primary contact for an existing startup.",
       });
+    }
+
+    // Compute progress for this email/startup before generating the link
+    async function computeProgressForEmail(startupRecordId, emailVal, step2UnlockedFlag) {
+      const progress = {
+        startupFormSubmitted: false,
+        representativeFormSubmitted: false,
+        anyTeamSubmitted: false,
+        emailHasTeamSubmission: false,
+        emailHasRepSubmission: false,
+        step2Unlocked: !!step2UnlockedFlag,
+      };
+      const safeEq = (a, b) =>
+        String(a || "").trim().toLowerCase() === String(b || "").trim().toLowerCase();
+      try {
+        if (startupRecordId) {
+          try {
+            const srec = await airtableBase(process.env.UTS_STARTUPS_TABLE_ID).find(
+              startupRecordId,
+            );
+            progress.startupFormSubmitted =
+              asOne(srec.get("New onboarding form submitted")) ||
+              asOne(srec.get("Onboarding Submitted"));
+          } catch (_) {}
+
+          try {
+            const team = await listTeamMembersByStartupId(startupRecordId);
+            progress.anyTeamSubmitted = team.some((r) =>
+              asOne(r.get("New onboarding form submitted")),
+            );
+            progress.representativeFormSubmitted = team.some(
+              (r) =>
+                asOne(r.get("Representative")) &&
+                asOne(r.get("New onboarding form submitted")),
+            );
+            if (emailVal) {
+              progress.emailHasTeamSubmission = team.some(
+                (r) =>
+                  safeEq(r.get("Personal email*"), emailVal) &&
+                  asOne(r.get("New onboarding form submitted")),
+              );
+              progress.emailHasRepSubmission = team.some(
+                (r) =>
+                  safeEq(r.get("Personal email*"), emailVal) &&
+                  asOne(r.get("Representative")) &&
+                  asOne(r.get("New onboarding form submitted")),
+              );
+            }
+          } catch (_) {}
+        } else if (emailVal) {
+          // Fallback: find by email across Team Members table
+          try {
+            const byEmail = await base(process.env.TEAM_MEMBERS_TABLE_ID)
+              .select({
+                filterByFormula:
+                  '{Personal email*} = "' + escapeAirtableString(emailVal) + '"',
+              })
+              .firstPage();
+            progress.anyTeamSubmitted = byEmail.some((r) =>
+              asOne(r.get("New onboarding form submitted")),
+            );
+            progress.emailHasTeamSubmission = progress.anyTeamSubmitted;
+            progress.emailHasRepSubmission = byEmail.some(
+              (r) =>
+                asOne(r.get("Representative")) &&
+                asOne(r.get("New onboarding form submitted")),
+            );
+          } catch (_) {}
+        }
+      } catch (_) {}
+      return progress;
     }
 
     // Generate magic link (carry UTS Startups record id when available)
@@ -810,19 +1221,24 @@ app.post("/lookup-email", async (req, res) => {
     );
     const expiresAt = new Date(Date.now() + 90 * 60 * 1000); // 90 minutes
 
-    // Update the target table with magic link
-    try {
-      await base(targetTable).update(startup.id, {
-        "Magic Link": magicLink,
-        "Token Expires At": expiresAt.toISOString(),
-        Link: magicLink,
-      });
-    } catch (updateError) {
-      log("error", "lookup_email.update_failed", { message: updateError.message }, req);
-      return res.status(500).json({
-        success: false,
-        message: "Failed to save magic link. Please try again.",
-      });
+    // Update the target table with magic link (fire-and-forget)
+    if (targetTable) {
+      Promise.resolve()
+        .then(() =>
+          base(targetTable).update(startup.id, {
+            "Magic Link": magicLink,
+            "Token Expires At": expiresAt.toISOString(),
+            Link: magicLink,
+          }),
+        )
+        .catch((updateError) => {
+          log(
+            "error",
+            "lookup_email.update_failed",
+            { message: updateError.message },
+            req,
+          );
+        });
     }
 
     // Provide different messages based on access type
@@ -832,6 +1248,18 @@ app.post("/lookup-email", async (req, res) => {
     } else if (accessType === "management") {
       message = "Access your startup dashboard to manage your team.";
     }
+    const progressPlaceholder = { pending: true };
+    Promise.resolve()
+      .then(() =>
+        computeProgressForEmail(
+          startup.startupRecordId || null,
+          email,
+          !!startup.step2Unlocked,
+        ),
+      )
+      .catch((error) => {
+        log("warn", "lookup_email.progress_failed", { message: error?.message });
+      });
 
     res.json({
       success: true,
@@ -839,6 +1267,7 @@ app.post("/lookup-email", async (req, res) => {
       accessType: accessType,
       magicLink: magicLink, // In production, this would be sent via email
       devMode: DEV_MODE,
+      progress: progressPlaceholder,
     });
   } catch (error) {
     console.error("Email lookup error:", error);
@@ -918,7 +1347,7 @@ app.post(
       )
         .toString()
         .trim();
-      // Expected discount category (preferring Manual Discount Category when manual check is present)
+      // Expected discount category (preferring Manual Discount Category when a manual validation exists)
       let expected =
         bodyExpected ||
         fieldStr(
@@ -927,19 +1356,9 @@ app.post(
             "Discount Category",
         ) ||
         "";
-      try {
-        const manualCheckField =
-          process.env.AIRTABLE_MEMBERS_MANUAL_OVERRIDE_FIELD ||
-          "Manual Discount Check";
-        const manualCategoryField =
-          process.env.AIRTABLE_MEMBERS_MANUAL_DISCOUNT_CATEGORY_FIELD ||
-          "Manual Discount Category";
-        const manualCheckVal = fieldStr(memberRec, manualCheckField);
-        if ((manualCheckVal || "").toString().trim()) {
-          const manualCat = fieldStr(memberRec, manualCategoryField);
-          if ((manualCat || "").toString().trim()) expected = manualCat;
-        }
-      } catch (_) {}
+      const manualInfo = manualOverrideInfo(memberRec);
+      if (manualInfo.hasOverride && manualInfo.category)
+        expected = manualInfo.category;
       const email =
         bodyEmail ||
         fieldStr(
@@ -964,37 +1383,32 @@ app.post(
         fieldStr(memberRec, "DOB") ||
         "";
 
-      // Manual override: if the Team Member record has a non-empty
-      // 'Manual Discount Check' field (configurable), bypass SKY validation
-      // and return a deterministic skipped result. We do NOT update Airtable
-      // validation fields in this path (record is used as-is).
-      try {
-        const manualField =
-          process.env.AIRTABLE_MEMBERS_MANUAL_OVERRIDE_FIELD ||
-          "Manual Discount Check";
-        const manualVal = fieldStr(memberRec, manualField);
-        if ((manualVal || "").toString().trim()) {
-          log(
-            "info",
-            "discount_check.skip_manual_override",
-            { memberRecordId, field: manualField },
-            req,
-          );
-          const result = {
-            valid: false,
-            status: "skipped",
-            reason: "manual_override",
-          };
-          return res.json({
-            success: true,
-            data: {
-              input: { memberRecordId, search_id, expected, email, name, dob },
-              result,
-              airtableUpdate: null,
-            },
-          });
-        }
-      } catch (_) {}
+      // Manual override: if the Team Member record has a manual validation
+      // recorded (Manual Discount Check or Discount Validated contains
+      // "manual"), bypass SKY validation and return a deterministic skipped
+      // result. We do NOT update Airtable validation fields in this path
+      // (record is used as-is).
+      if (manualInfo.hasOverride) {
+        log(
+          "info",
+          "discount_check.skip_manual_override",
+          { memberRecordId },
+          req,
+        );
+        const result = {
+          valid: false,
+          status: "skipped",
+          reason: "manual_override",
+        };
+        return res.json({
+          success: true,
+          data: {
+            input: { memberRecordId, search_id, expected, email, name, dob },
+            result,
+            airtableUpdate: null,
+          },
+        });
+      }
 
       // Skip validation when no discount requested (expected empty or 'None of the above')
       if (!hasDiscountRequest(expected)) {
@@ -1176,11 +1590,12 @@ app.get("/dashboard/:token", verifyToken, async (req, res) => {
           : req.user.startupRecordId || null;
       startup = {
         id: eoiRecord.id,
-        name: eoiRecord.get("Startup Name (or working title)"),
+        name: eoiRecord.get("Startup Name"),
         primaryContact: eoiRecord.get("Primary contact email"),
         status: eoiRecord.get("Status"),
         onboardingSubmitted: eoiRecord.get("Onboarding Submitted") || 0,
         startupRecordId: startupRecordIdFromEOI,
+        representativeEmail: eoiRecord.get("Representative Email") || null,
       };
       isEOIApproved = true;
     } catch (error) {
@@ -1194,9 +1609,22 @@ app.get("/dashboard/:token", verifyToken, async (req, res) => {
           name: startupRecord.get("Startup Name (or working title)"),
           primaryContact: startupRecord.get("Primary contact email"),
           recordId: startupRecord.get("Record ID"),
-          status: startupRecord.get("Startup status"),
+          status: startupRecord.get("Status"),
           onboardingSubmitted: startupRecord.get("Onboarding Submitted") || 0,
           startupRecordId: startupRecord.id,
+          representativeFormUrl:
+            startupRecord.get("03. Startup Representative Details Prefilled"),
+          teamMemberFormUrl:
+            startupRecord.get("04. Nominated Personnel Details"),
+          description:
+            startupRecord.get("Description*") ||
+            startupRecord.get("Description") ||
+            null,
+          abn: startupRecord.get("ABN") || null,
+          registeredBusinessName:
+          startupRecord.get("Registered Business Name") || null,
+          representativeEmail:
+            startupRecord.get("Representative Email") || null,
         };
       } catch (innerError) {
         throw new Error("Startup not found");
@@ -1222,6 +1650,29 @@ app.get("/dashboard/:token", verifyToken, async (req, res) => {
           );
           memberFilterName = currentName;
         }
+        // Also capture form URLs for client fallback
+        try {
+          startup.representativeFormUrl =
+            srForName.get("03. Startup Representative Details Prefilled") ||
+            startup.representativeFormUrl || null;
+          startup.teamMemberFormUrl =
+            srForName.get("04. Nominated Personnel Details") ||
+            startup.teamMemberFormUrl || null;
+          startup.description =
+            srForName.get("Description*") ||
+            srForName.get("Description") ||
+            startup.description ||
+            null;
+          startup.abn = srForName.get("ABN") || startup.abn || null;
+          startup.registeredBusinessName =
+            srForName.get("Registered Business Name") ||
+            startup.registeredBusinessName ||
+            null;
+          startup.representativeEmail =
+            srForName.get("Representative Email") ||
+            startup.representativeEmail ||
+            null;
+        } catch (_) {}
       }
     } catch (_) {
       /* ignore */
@@ -1230,22 +1681,40 @@ app.get("/dashboard/:token", verifyToken, async (req, res) => {
       ? await listTeamMembersByStartupId(startup.startupRecordId)
       : [];
 
-    const teamMembers = teamMemberRecords.map((record) => ({
-      id: record.id,
-      name: record.get("Team member ID") || "Unknown",
-      email: record.get("Personal email*"),
-      mobile: record.get("Mobile*"),
-      position: record.get("Position at startup*") || record.get("Role"),
-      representative: asOne(record.get("Representative")),
-      utsAssociation: record.get("What is your association to UTS?*"),
-      status: record.get("Team Member Status"),
-    }));
+    const teamMembers = teamMemberRecords
+      .map((record) => mapTeamMemberRecord(record))
+      .filter(Boolean);
+
+    const management = await buildManagementData(teamMembers);
+    const representativeMember = teamMembers.find((m) => m.representative);
+    const firstPointOfContact = representativeMember
+      ? {
+          memberId: representativeMember.id,
+          name: representativeMember.name,
+          role: representativeMember.position || null,
+          email:
+            representativeMember.email ||
+            startup.representativeEmail ||
+            startup.primaryContact ||
+            email,
+          source: "team-member",
+        }
+      : {
+          memberId: null,
+          name: startup.primaryContact || startup.name || "Primary contact",
+          role: null,
+          email:
+            startup.representativeEmail || startup.primaryContact || email || "",
+          source: startup.representativeEmail ? "startup-record" : "magic-link",
+        };
 
     const dashboardData = {
       startup,
       teamMembers,
       token: req.params.token,
       isEOIApproved,
+      management,
+      firstPointOfContact,
       formUrls: {
         startupOnboarding: process.env.STARTUP_ONBOARDING_FORM_URL,
         teamMember: process.env.TEAM_MEMBER_FORM_URL,
@@ -1277,42 +1746,775 @@ app.get("/dashboard/:token", verifyToken, async (req, res) => {
 // Update profile endpoint
 app.post("/update-profile", verifyToken, async (req, res) => {
   try {
-    const { memberId, updates } = req.body;
-
-    if (!memberId || !updates) {
+    const { memberId, updates } = req.body || {};
+    if (!memberId || !updates || typeof updates !== "object") {
       return res
         .status(400)
         .json({ success: false, message: "Missing required fields" });
     }
 
-    await base(process.env.TEAM_MEMBERS_TABLE_ID).update(memberId, updates);
+    // Only allow specific fields and normalize types
+    const allowed = new Set([
+      "Team member ID",
+      "First Name*",
+      "Last Name*",
+      "Personal email*",
+      "Mobile*",
+      "Date of birth*",
+      "Photo*",
+      "Team Member Status",
+      "Date TM Offboarded",
+    ]);
+    const payload = {};
+    for (const [k, v] of Object.entries(updates)) {
+      if (!allowed.has(k)) continue;
+      if (k === "Mobile*") {
+        if (v == null || v === "") continue;
+        const digits = String(v).replace(/[^0-9]/g, "");
+        if (!digits) continue;
+        payload[k] = Number(digits);
+        continue;
+      }
+      if (k === "Date of birth*" || k === "Date TM Offboarded") {
+        if (v == null || v === "") continue;
+        const d = new Date(String(v));
+        if (!isNaN(d.getTime())) {
+          payload[k] = d.toISOString().slice(0, 10);
+        }
+        continue;
+      }
+      if (k === "Photo*") {
+        if (Array.isArray(v)) {
+          payload[k] = v;
+        } else if (typeof v === "string" && v.trim()) {
+          payload[k] = [{ url: v.trim() }];
+        }
+        continue;
+      }
+      payload[k] = v;
+    }
 
+    if (!Object.keys(payload).length) {
+      return res
+        .status(400)
+        .json({ success: false, message: "No supported fields to update" });
+    }
+
+    await base(process.env.TEAM_MEMBERS_TABLE_ID).update(memberId, payload);
+    log(
+      "info",
+      "profile.update",
+      { memberId, fields: Object.keys(payload) },
+      req,
+    );
     res.json({ success: true, message: "Profile updated successfully!" });
   } catch (error) {
-    console.error("Profile update error:", error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to update profile. Please try again.",
+    const msg = error && (error.message || error.error || "");
+    log("error", "profile.update.error", { message: msg }, req);
+    const isField = /Unknown field name/i.test(String(msg));
+    const isSelect = /INVALID_SINGLE_SELECTIONS|invalid/i.test(String(msg));
+    const hint = isField
+      ? "Unknown field name in request"
+      : isSelect
+      ? "Invalid value for a select field"
+      : "Failed to update profile. Please try again.";
+    res.status(500).json({ success: false, message: hint });
+  }
+});
+
+async function logMembershipEvent(agentMemberId, attribute, fromValue, toValue, req) {
+  if (!hasAgentBase() || !agentMemberId) return { skipped: true };
+  const correlation = crypto.randomBytes(8).toString("hex");
+  const baseEvent = {
+    "From Value": fromValue || "",
+    "To Value": toValue || "",
+    Actor: req.user && req.user.email ? String(req.user.email) : "",
+    "Effective At": new Date().toISOString(),
+    Member: [agentMemberId],
+    "Correlation ID": correlation,
+  };
+  try {
+    await agentBase(AGENT_MEMBERSHIP_EVENTS_TABLE_ID).create({
+      Attribute: attribute,
+      ...baseEvent,
     });
+  } catch (inner) {
+    await agentBase(AGENT_MEMBERSHIP_EVENTS_TABLE_ID).create(baseEvent);
+    log("warn", "membership.event.partial", { message: inner?.message }, req);
+  }
+  return { ok: true, correlation };
+}
+
+app.post("/team-members/offboard", verifyToken, async (req, res) => {
+  try {
+    const { memberId, agentMemberId, membershipType } = req.body || {};
+    if (!memberId) {
+      return res
+        .status(400)
+        .json({ success: false, message: "memberId is required" });
+    }
+
+    // Update main base: set offboard date
+    await base(process.env.TEAM_MEMBERS_TABLE_ID).update(memberId, {
+      "Date TM Offboarded": ymd(),
+    });
+
+    // Log event to agent base (optional)
+    try {
+      await logMembershipEvent(
+        agentMemberId,
+        "membership_type",
+        membershipType || "active",
+        "Offboarded",
+        req,
+      );
+    } catch (e) {
+      log("warn", "offboard.event_failed", { message: e?.message }, req);
+    }
+
+    log("info", "team_member.offboarded", { memberId, agentMemberId }, req);
+    return res.json({ success: true });
+  } catch (error) {
+    log("error", "team_member.offboard.error", { message: error?.message }, req);
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to offboard member" });
+  }
+});
+
+app.post("/team-members/onboard", verifyToken, async (req, res) => {
+  try {
+    const { memberId, agentMemberId, membershipType } = req.body || {};
+    if (!memberId) {
+      return res
+        .status(400)
+        .json({ success: false, message: "memberId is required" });
+    }
+
+    // Clear offboard date
+    await base(process.env.TEAM_MEMBERS_TABLE_ID).update(memberId, {
+      "Date TM Offboarded": null,
+    });
+
+    // Log event to agent base (optional)
+    try {
+      await logMembershipEvent(
+        agentMemberId,
+        "membership_type",
+        "Offboarded",
+        membershipType || "active",
+        req,
+      );
+    } catch (e) {
+      log("warn", "onboard.event_failed", { message: e?.message }, req);
+    }
+
+    log("info", "team_member.onboarded", { memberId, agentMemberId }, req);
+    return res.json({ success: true });
+  } catch (error) {
+    log("error", "team_member.onboard.error", { message: error?.message }, req);
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to onboard member" });
+  }
+});
+
+app.post("/startups/update-field", verifyToken, async (req, res) => {
+  try {
+    const { field, value } = req.body || {};
+    if (!field) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Field is required" });
+    }
+    const startupRecordId = await resolveStartupRecordIdForUser(req.user);
+    if (!startupRecordId) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Startup context not found" });
+    }
+
+    const fieldMap = new Map([
+      ["Startup Name (or working title)", "Startup Name*"],
+      ["Startup Name*", "Startup Name*"],
+      ["Description*", "Description*"],
+      ["Description", "Description*"],
+      ["ABN", "ABN"],
+      ["Registered Business Name", "Registered Business Name"],
+      ["Primary contact email*", "Primary contact email"],
+      ["Primary contact email", "Primary contact email"],
+      ["Primary contact first name", "Primary contact first name"],
+      ["Primary contact first name*", "Primary contact first name"],
+    ]);
+    if (!fieldMap.has(field)) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Field not supported" });
+    }
+
+async function resolveFieldName(candidates) {
+      const uniq = Array.from(
+        new Set(
+          (candidates || []).map((c) => (c == null ? "" : String(c).trim())).filter(Boolean),
+        ),
+      );
+      const normalize = (s) =>
+        String(s || "")
+          .replace(/[*]/g, "")
+          .replace(/\s+/g, " ")
+          .trim()
+          .toLowerCase();
+
+      for (const candidate of uniq) {
+        try {
+          await airtableBase(process.env.UTS_STARTUPS_TABLE_ID)
+            .select({ maxRecords: 1, pageSize: 1, fields: [candidate] })
+            .firstPage();
+          return candidate;
+        } catch (err) {
+          const msg = (err && err.message) || "";
+          if (/unknown field name/i.test(msg)) continue;
+          throw err;
+        }
+      }
+
+      // Loose, case-insensitive match against available fields (helps when names differ slightly)
+      try {
+        const sample = await airtableBase(process.env.UTS_STARTUPS_TABLE_ID)
+          .select({ maxRecords: 1, pageSize: 1 })
+          .firstPage();
+        const fieldNames =
+          sample && sample[0] && sample[0].fields
+            ? Object.keys(sample[0].fields)
+            : [];
+        const targets = uniq.map((c) => normalize(c));
+        const match = fieldNames.find((name) => targets.includes(normalize(name)));
+        if (match) return match;
+      } catch (_) {
+        /* ignore */
+      }
+
+      return null;
+    }
+
+    const baseField = fieldMap.get(field);
+    let candidates = [baseField];
+  if (baseField === "Primary contact email")
+    candidates = ["Primary contact email", "Primary contact email*"];
+  else if (baseField === "Primary contact first name")
+    candidates = ["Primary contact first name", "Primary contact first name*"];
+  else if (baseField === "ABN")
+      candidates = ["ABN", "ABN*", "ABN / ACN", "ABN/ACN"];
+
+    const airtableField = await resolveFieldName(candidates);
+    if (!airtableField) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Field not found in Airtable" });
+    }
+
+    const update = {};
+
+    // Normalize ABN/ACN numeric fields
+    const abnCandidates = ["abn", "abn*", "abn / acn", "abn/acn"];
+    const isAbnField = abnCandidates.includes(
+      String(airtableField || "").trim().toLowerCase(),
+    );
+    if (isAbnField) {
+      const digits = String(value || "")
+        .replace(/[^0-9]/g, "")
+        .trim();
+      if (!digits) {
+        return res
+          .status(400)
+          .json({ success: false, message: "ABN must contain digits only" });
+      }
+      const num = Number(digits);
+      if (!Number.isFinite(num)) {
+        return res
+          .status(400)
+          .json({ success: false, message: "ABN must be a valid number" });
+      }
+      update[airtableField] = num;
+    } else {
+      update[airtableField] = value || null;
+    }
+
+    if (
+      airtableField === "Primary contact email" ||
+      airtableField === "Primary contact email*"
+    ) {
+      if (!value || !String(value).includes("@")) {
+        return res
+          .status(400)
+          .json({ success: false, message: "Valid email is required" });
+      }
+    }
+    await airtableBase(process.env.UTS_STARTUPS_TABLE_ID).update(
+      startupRecordId,
+      update,
+    );
+    log(
+      "info",
+      "startup.field.update",
+      { startupRecordId, field, hasValue: !!value },
+      req,
+    );
+    res.json({ success: true });
+  } catch (error) {
+    log("error", "startup.field.update.error", { message: error?.message }, req);
+    res
+      .status(500)
+      .json({ success: false, message: "Failed to update startup" });
+  }
+});
+
+app.get("/startup-info/:token", verifyToken, async (req, res) => {
+  try {
+    const startupRecordId = await resolveStartupRecordIdForUser(req.user);
+    if (!startupRecordId) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Startup context not found" });
+    }
+    const record = await airtableBase(
+      process.env.UTS_STARTUPS_TABLE_ID,
+    ).find(startupRecordId);
+    const payload = {
+      id: record.id,
+      startupRecordId: record.id,
+      recordId: record.get("Record ID") || null,
+      name: record.get("Startup Name (or working title)") || "",
+      description:
+        record.get("Description*") ||
+        record.get("Description") ||
+        "",
+      abn: record.get("ABN") || "",
+      registeredBusinessName:
+        record.get("Registered Business Name") || "",
+      primaryContact: record.get("Primary contact email") || "",
+      representativeEmail: record.get("Representative Email") || "",
+      representativeFormUrl:
+        record.get("03. Startup Representative Details Prefilled") || "",
+      teamMemberFormUrl:
+        record.get("04. Nominated Personnel Details") || "",
+      status: record.get("Status") || "",
+    };
+    return res.json({ success: true, data: payload });
+  } catch (error) {
+    log(
+      "error",
+      "startup.info.error",
+      { message: error?.message },
+      req,
+    );
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to load startup info" });
+  }
+});
+
+app.get("/management-data/:token", verifyToken, async (req, res) => {
+  try {
+    const startupRecordId = await resolveStartupRecordIdForUser(req.user);
+    if (!startupRecordId) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Startup context not found" });
+    }
+    const teamMemberRecords = await listTeamMembersByStartupId(
+      startupRecordId,
+    );
+    const teamMembers = teamMemberRecords
+      .map((record) => mapTeamMemberRecord(record))
+      .filter(Boolean);
+    const management = await buildManagementData(teamMembers);
+    return res.json({ success: true, data: management });
+  } catch (error) {
+    log("error", "management_data.error", { message: error?.message });
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to load management data" });
+  }
+});
+
+app.get("/financial-transactions/:token", verifyToken, async (req, res) => {
+  try {
+    if (!hasAgentBase()) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "Financial data is not available in this environment. Please contact support.",
+      });
+    }
+    const startupRecordId = await resolveStartupRecordIdForUser(req.user);
+    if (!startupRecordId) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Startup context not found." });
+    }
+    const teamMemberRecords = await listTeamMembersByStartupId(
+      startupRecordId,
+    );
+    const portalIds = new Set([startupRecordId]);
+    for (const rec of teamMemberRecords) {
+      const rollups = rec.get("Record ID (from Startup*)");
+      if (Array.isArray(rollups)) {
+        rollups.forEach((id) => id && portalIds.add(String(id)));
+      }
+      const direct = rec.get("Startup*");
+      if (Array.isArray(direct)) {
+        direct.forEach((id) => id && portalIds.add(String(id)));
+      }
+    }
+    const emails = teamMemberRecords
+      .map((rec) => String(rec.get("Personal email*") || "").toLowerCase())
+      .filter(Boolean);
+    const portalIdsFromAgent = await resolvePortalStartupIdsForEmails(emails);
+    portalIdsFromAgent.forEach((id) => id && portalIds.add(String(id)));
+    const agentIds = Array.from(
+      new Set(await resolveAgentStartupIdsForPortal(Array.from(portalIds))),
+    );
+    const startupIdentity = await resolveStartupLookup(
+      startupRecordId,
+      agentIds,
+    );
+    const ledgerEntries = await fetchFinancialTransactionsForStartup(
+      startupRecordId,
+      agentIds,
+      startupIdentity,
+    );
+    const membershipEntries = await fetchMembershipTransactionsForStartup(
+      startupRecordId,
+      agentIds,
+      startupIdentity,
+    );
+    const entries = [...ledgerEntries, ...membershipEntries].sort(
+      (a, b) => getEntrySortValue(b) - getEntrySortValue(a),
+    );
+    const totals = entries.reduce(
+      (acc, entry) => {
+        acc.debits += entry.debitAmount || 0;
+        acc.credits += entry.creditAmount || 0;
+        return acc;
+      },
+      { debits: 0, credits: 0 },
+    );
+    return res.json({
+      success: true,
+      data: { entries, totals },
+    });
+  } catch (error) {
+    log(
+      "error",
+      "financial_transactions.error",
+      { message: error?.message },
+      req,
+    );
+    return res.status(500).json({
+      success: false,
+      message: "Failed to load financial transactions",
+    });
+  }
+});
+
+app.post("/membership/update", verifyToken, async (req, res) => {
+  try {
+    if (!hasAgentBase()) {
+      return res.status(400).json({
+        success: false,
+        message: "Membership management is not available in this environment",
+      });
+    }
+    const { memberId, agentMemberId, updates } = req.body || {};
+    if (!memberId || !updates) {
+      return res.status(400).json({
+        success: false,
+        message: "Missing member identifiers or updates",
+      });
+    }
+    const startupRecordId = await resolveStartupRecordIdForUser(req.user);
+    if (!startupRecordId) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Startup context not found" });
+    }
+    const teamMemberRecords = await listTeamMembersByStartupId(
+      startupRecordId,
+    );
+    const authorized = teamMemberRecords.some((rec) => rec.id === memberId);
+    if (!authorized) {
+      return res
+        .status(403)
+        .json({ success: false, message: "Member does not belong to startup" });
+    }
+
+    // Only membership type is supported here
+    if (!Object.prototype.hasOwnProperty.call(updates, "membershipType")) {
+      return res.status(400).json({
+        success: false,
+        message: "Only membershipType updates are supported",
+      });
+    }
+
+    // Fetch current member snapshot from agent base for comparison and event logging
+    let agentMember;
+    try {
+      agentMember = await agentBase(AGENT_TEAM_MEMBERS_TABLE_ID).find(
+        agentMemberId,
+      );
+    } catch (e) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Agent member not found" });
+    }
+
+    const oldTypeRaw = agentMember.get("Membership Type");
+    const oldType = normalizeSelectValue(oldTypeRaw) || "";
+    const newType = updates.membershipType || "";
+
+    // Validate requested type against catalog (if provided)
+    const types = await getAgentMembershipTypes();
+    const allowed = new Set((types || []).map((t) => t.name));
+    if (newType && !allowed.has(newType)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid membership type",
+      });
+    }
+
+    // Short-circuit when unchanged
+    if ((oldType || "") === (newType || "")) {
+      return res.json({ success: true, unchanged: true });
+    }
+
+    // Update membership type in the PRIMARY base (Team Members)
+    await base(process.env.TEAM_MEMBERS_TABLE_ID).update(memberId, {
+      "Membership Type": newType || null,
+    });
+
+    // Log event in Membership Event History
+    try {
+      const correlation = crypto.randomBytes(8).toString("hex");
+      if (hasAgentBase() && agentMemberId) {
+        // Use allowed select values: Attribute uses 'membership_type' in this base.
+        const baseEvent = {
+          "From Value": oldType,
+          "To Value": newType,
+          Actor: req.user && req.user.email ? String(req.user.email) : "",
+          "Effective At": new Date().toISOString(),
+          Member: [agentMemberId],
+          "Correlation ID": correlation,
+        };
+        try {
+          await agentBase(AGENT_MEMBERSHIP_EVENTS_TABLE_ID).create({
+            Attribute: "membership_type",
+            ...baseEvent,
+          });
+        } catch (inner) {
+          // Fallback without the Attribute select if choices are locked
+          await agentBase(AGENT_MEMBERSHIP_EVENTS_TABLE_ID).create(baseEvent);
+          log("warn", "membership.update.event_partial", { message: inner?.message }, req);
+        }
+      }
+    } catch (e) {
+      // Non-fatal: update succeeded; event logging failed
+      log("warn", "membership.update.event_failed", { message: e?.message }, req);
+    }
+
+    log(
+      "info",
+      "membership.update",
+      { memberId, agentMemberId, from: oldType, to: newType },
+      req,
+    );
+    return res.json({ success: true });
+  } catch (error) {
+    log("error", "membership.update.error", { message: error?.message }, req);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to update membership",
+    });
+  }
+});
+
+app.patch("/team-members/:memberId/role", verifyToken, async (req, res) => {
+  try {
+    const { memberId } = req.params || {};
+    const { role } = req.body || {};
+    if (!memberId) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Member id is required" });
+    }
+    const startupRecordId = await resolveStartupRecordIdForUser(req.user);
+    if (!startupRecordId) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Startup context not found" });
+    }
+    const sanitizedRole =
+      role == null ? "" : String(role).trim().slice(0, 160);
+    let record = null;
+    try {
+      record = await base(process.env.TEAM_MEMBERS_TABLE_ID).find(memberId);
+    } catch (_) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Member not found" });
+    }
+    const linkedFields = ["Startup*", "Startup", "UTS Startups"];
+    const linkMatches = linkedFields.some((field) => {
+      const val = record.get(field);
+      if (!val) return false;
+      if (Array.isArray(val))
+        return val.map(String).includes(String(startupRecordId));
+      return String(val) === String(startupRecordId);
+    });
+    if (!linkMatches) {
+      return res.status(403).json({
+        success: false,
+        message: "Member does not belong to this startup",
+      });
+    }
+    const payload = {};
+    payload[MEMBER_ROLE_FIELD] = sanitizedRole || null;
+    await base(process.env.TEAM_MEMBERS_TABLE_ID).update(memberId, payload);
+    log(
+      "info",
+      "member.role.update",
+      { memberId, startupRecordId, hasRole: !!sanitizedRole },
+      req,
+    );
+    return res.json({
+      success: true,
+      data: { role: sanitizedRole || null },
+    });
+  } catch (error) {
+    log("error", "member.role.update.error", { message: error?.message }, req);
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to update member role" });
   }
 });
 
 // New API endpoints for individual form data fetching
 
+// Onboarding state for dashboard locking
+app.get("/onboarding-state/:token", verifyToken, async (req, res) => {
+  try {
+    const startupRecordId = await resolveStartupRecordIdForUser(req.user);
+    if (!startupRecordId) {
+      return res.json({
+        success: true,
+        data: {
+          step1Complete: false,
+          step2Complete: false,
+          step3Complete: false,
+          signedAgreement: false,
+        },
+      });
+    }
+
+    // Fetch Startups record
+    let startupRec = null;
+    try {
+      startupRec = await airtableBase(process.env.UTS_STARTUPS_TABLE_ID).find(
+        startupRecordId,
+      );
+    } catch (_) {}
+
+    const step1Complete = !!(
+      startupRec &&
+        (asOne(startupRec.get("Onboarding Submitted")) ||
+          asOne(startupRec.get("New onboarding form submitted")))
+    );
+    const signedAgreement = !!(
+      startupRec &&
+        Array.isArray(startupRec.get("Signed Agreement")) &&
+        startupRec.get("Signed Agreement").length > 0
+    );
+    const representativeEmailPresent = !!(
+      startupRec &&
+      startupRec.get &&
+      String(startupRec.get("Representative Email") || "").trim()
+    );
+
+    // Team members
+    const members = await listTeamMembersByStartupId(startupRecordId);
+    let step2Complete = members.some(
+      (r) => asOne(r.get("Representative")) && asOne(r.get("New onboarding form submitted")),
+    );
+    // Lock Step 2 when the Startups record already has a Representative Email populated
+    const step2LockedByRepEmail = !step2Complete && representativeEmailPresent;
+    if (step2LockedByRepEmail) step2Complete = true;
+    const step3Complete = members.some((r) => asOne(r.get("New onboarding form submitted")));
+
+    return res.json({
+      success: true,
+      data: { step1Complete, step2Complete, step3Complete, signedAgreement, step2LockedByRepEmail },
+    });
+  } catch (e) {
+    log("error", "onboarding_state.error", { message: e?.message }, req);
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to compute onboarding state" });
+  }
+});
+
 // Endpoint to fetch header information (EOI and Email)
 app.get("/get-header-info/:token", verifyToken, async (req, res) => {
   try {
-    const { startupId } = req.user;
+    const { startupId, startupName, email: tokenEmail } = req.user || {};
+    let displayName = null;
+    let displayEmail = null;
 
-    // Get EOI and Email from EOI table
-    const eoiRecord = await base(process.env.UTS_EOI_TABLE_ID).find(startupId);
-    const eoiName = eoiRecord.get("EOI");
-    const email = eoiRecord.get("Email");
+    // Try EOI record first
+    if (startupId) {
+      try {
+        const eoiRecord = await base(process.env.UTS_EOI_TABLE_ID).find(
+          startupId,
+        );
+        displayName =
+          eoiRecord.get("EOI") ||
+          eoiRecord.get("Startup Name") ||
+          eoiRecord.get("Startup Name (or working title)") ||
+          null;
+        displayEmail = eoiRecord.get("Email") || null;
+      } catch (_) {
+        /* not an EOI id */
+      }
+    }
+
+    // Fallback to UTS Startups table
+    if ((!displayName || !displayEmail) && startupId) {
+      try {
+        const startupRec = await airtableBase(
+          process.env.UTS_STARTUPS_TABLE_ID,
+        ).find(startupId);
+        if (!displayName)
+          displayName =
+            startupRec.get("Startup Name (or working title)") ||
+            startupRec.get("Registered Business Name") ||
+            null;
+        if (!displayEmail)
+          displayEmail =
+            startupRec.get("Representative Email") ||
+            startupRec.get("Primary contact email") ||
+            null;
+      } catch (_) {
+        /* ignore */
+      }
+    }
+
+    // Final fallbacks to token data
+    if (!displayName) displayName = startupName || "UTS Startup";
+    if (!displayEmail) displayEmail = tokenEmail || "No contact email";
 
     res.json({
       success: true,
-      eoiName: eoiName || "No EOI Name",
-      email: email || "No Email",
+      eoiName: displayName,
+      email: displayEmail,
     });
   } catch (error) {
     console.error("Get header info error:", error);
@@ -1515,40 +2717,73 @@ app.post(
 // Endpoint to fetch Team Members form URL
 app.get("/get-team-members-form/:token", verifyToken, async (req, res) => {
   try {
-    const { startupId } = req.user;
+    // Prefer Startups record id from token/context; fall back to EOI linkage
+    const startupRecordId = await resolveStartupRecordIdForUser(req.user);
+    if (startupRecordId) {
+      try {
+        const srec = await airtableBase(process.env.UTS_STARTUPS_TABLE_ID).find(
+          startupRecordId,
+        );
+        const teamMembersFormUrl = srec.get(
+          "04. Nominated Personnel Details",
+        );
+        let outUrl = teamMembersFormUrl || null;
+        if (outUrl) {
+          outUrl = augmentUrlWithParams(outUrl, [
+            ["prefill_Startup", startupRecordId],
+            ["hide_Startup", "true"],
+            ["prefill_Startup*", startupRecordId],
+            ["hide_Startup*", "true"],
+          ]);
+        }
+        return res.json({ success: true, formUrl: outUrl });
+      } catch (e) {
+        // fall through to EOI path if lookup fails
+      }
+    }
 
-    // Step 1: Get UTS Startups field from EOI table
+    // Try direct Startups lookup via token's startupId (when token carries Startups id)
+    const { startupId } = req.user;
+    if (startupId) {
+      try {
+        const srec2 = await airtableBase(process.env.UTS_STARTUPS_TABLE_ID).find(
+          startupId,
+        );
+        const teamMembersFormUrl2 = srec2.get(
+          "04. Nominated Personnel Details",
+        );
+        let outUrl2 = teamMembersFormUrl2 || null;
+        if (outUrl2) {
+          outUrl2 = augmentUrlWithParams(outUrl2, [
+            ["prefill_Startup", startupId],
+            ["hide_Startup", "true"],
+            ["prefill_Startup*", startupId],
+            ["hide_Startup*", "true"],
+          ]);
+        }
+        return res.json({ success: true, formUrl: outUrl2 });
+      } catch (_) {
+        /* fall through */
+      }
+    }
+
+    // Fallback: EOI path
+    
+    
     const eoiRecord = await base(process.env.UTS_EOI_TABLE_ID).find(startupId);
     const utsStartupsField = eoiRecord.get("UTS Startups");
-
     if (!utsStartupsField || utsStartupsField.length === 0) {
       return res.json({
         success: false,
         message: "Fill in Startup Information Form",
       });
     }
-
-    // Step 2: Get primary contact email from linked UTS Startups record
     const linkedStartupRecord = await airtableBase(
       process.env.UTS_STARTUPS_TABLE_ID,
     ).find(utsStartupsField[0]);
-    const primaryContactEmail = linkedStartupRecord.get(
-      "Primary contact email",
-    );
-
-    if (!primaryContactEmail) {
-      return res.json({
-        success: false,
-        message: "Primary contact email not found",
-      });
-    }
-
-    // Step 3: Get team members form URL
     const teamMembersFormUrl = linkedStartupRecord.get(
       "04. Nominated Personnel Details",
     );
-
-    // Augment with authoritative Startup prefill/hide parameters
     let outUrl = teamMembersFormUrl || null;
     if (outUrl) {
       const startupRecId = utsStartupsField[0];
@@ -1559,14 +2794,10 @@ app.get("/get-team-members-form/:token", verifyToken, async (req, res) => {
         ["hide_Startup*", "true"],
       ]);
     }
-
-    res.json({
-      success: true,
-      formUrl: outUrl,
-    });
+    return res.json({ success: true, formUrl: outUrl });
   } catch (error) {
     console.error("Get team members form error:", error);
-    res.status(500).json({
+    return res.status(500).json({
       success: false,
       message: "Failed to fetch team members form URL.",
     });
@@ -1574,57 +2805,81 @@ app.get("/get-team-members-form/:token", verifyToken, async (req, res) => {
 });
 
 // Endpoint for submission confirmation
-app.patch("/submission-confirmation/:token", verifyToken, async (req, res) => {
+app.patch('/submission-confirmation/:token', verifyToken, async (req, res) => {
   try {
     const { startupId } = req.user;
 
-    console.log("Submission confirmation request for startupId:", startupId);
+    console.log('Submission confirmation request for startupId:', startupId);
 
-    // Step 2.1: Fetch data from 'UTS Startups EOI' table from 'UTS Startups' field
-    const eoiRecord = await base(process.env.UTS_EOI_TABLE_ID).find(startupId);
-    const utsStartupsField = eoiRecord.get("UTS Startups");
+    // Prefer Startups record id from token/context; fall back to EOI linkage; then try direct Startups id
+    let linkedRecordId = await resolveStartupRecordIdForUser(req.user);
 
-    console.log("UTS Startups field from EOI table:", utsStartupsField);
+    // Try direct Startups lookup via token's startupId (when token carries Startups id)
+    if (!linkedRecordId && startupId) {
+      try {
+        const srec = await airtableBase(process.env.UTS_STARTUPS_TABLE_ID).find(
+          startupId,
+        );
+        linkedRecordId = srec.id;
+      } catch (_) {
+        // ignore and fall through
+      }
+    }
 
-    if (!utsStartupsField || utsStartupsField.length === 0) {
+    // Last fallback: EOI linkage via 'UTS Startups' field
+    if (!linkedRecordId && startupId) {
+      try {
+        const eoiRecord = await base(process.env.UTS_EOI_TABLE_ID).find(startupId);
+        const utsStartupsField = eoiRecord.get('UTS Startups');
+        console.log('UTS Startups field from EOI table:', utsStartupsField);
+        if (utsStartupsField && utsStartupsField.length > 0) {
+          linkedRecordId = utsStartupsField[0];
+        }
+      } catch (_) {
+        // ignore and fall through
+      }
+    }
+
+    if (!linkedRecordId) {
       return res.json({
         success: false,
-        message: "No linked startup record found in EOI table",
+        message: 'No linked startup record found. Please complete the Startup Information form or request a new link.',
       });
     }
 
-    // Step 2.2: Get the record ID from the response
-    const linkedRecordId = utsStartupsField[0];
-    console.log("Linked record ID:", linkedRecordId);
+    // Update Submission Confirmation on the linked Startups record
+    await airtableBase(process.env.UTS_STARTUPS_TABLE_ID).update(linkedRecordId, {
+      'Submission Confirmation': true,
+    });
 
-    // Step 2.3: PATCH request to UTS Startups table to update Submission Confirmation
-    const updateData = {
-      fields: {
-        "Submission Confirmation": "true",
-      },
-    };
+    console.log('Successfully updated Submission Confirmation to true for', linkedRecordId);
 
-    console.log("Updating record with data:", updateData);
+    const kickoff = await startValidationAndPdfJob(linkedRecordId, req);
+    if (!kickoff.ok) {
+      return res.status(kickoff.status || 500).json({
+        success: false,
+        message: kickoff.message || 'Failed to start agreement generation',
+      });
+    }
 
-    await airtableBase(process.env.UTS_STARTUPS_TABLE_ID).update(
-      linkedRecordId,
-      {
-        "Submission Confirmation": true,
-      },
-    );
-
-    console.log("Successfully updated Submission Confirmation to true");
-
-    res.json({
+    return res.json({
       success: true,
-      message: "Submission confirmed successfully",
+      message: kickoff.alreadyRunning
+        ? 'Submission confirmed. Agreement generation already running.'
+        : 'Submission confirmed successfully',
       recordId: linkedRecordId,
+      job: {
+        state: kickoff.job.state,
+        startedAt: kickoff.job.startedAt,
+        progress: kickoff.job.progress,
+      },
+      jobAlreadyRunning: !!kickoff.alreadyRunning,
     });
   } catch (error) {
-    console.error("Submission confirmation error:", error);
-    res.status(500).json({
+    console.error('Submission confirmation error:', error);
+    return res.status(500).json({
       success: false,
-      message: "Failed to confirm submission: " + error.message,
+      message: 'Failed to confirm submission: ' + error.message,
     });
   }
 });
@@ -1821,7 +3076,7 @@ app.post("/reconcile-status/:token", verifyToken, async (req, res) => {
       asOne(startupRec.get("New onboarding form submitted")) ||
       asOne(startupRec.get("Onboarding Submitted"));
     const currentStartupStatus = (
-      startupRec.get("Startup status") || ""
+      startupRec.get("Status") || ""
     ).toString();
     log(
       "debug",
@@ -2186,21 +3441,10 @@ async function buildPdfPayload({ startupRecordId, memberRecordId }) {
     return null;
   }
 
-  // Determine effective category: use Manual Discount Category when Manual Discount Check is set
+  // Determine effective category: prefer Manual Discount Category when manual override is active
   function effectiveDiscountCategory(rec) {
-    try {
-      const manualCheckField =
-        process.env.AIRTABLE_MEMBERS_MANUAL_OVERRIDE_FIELD ||
-        "Manual Discount Check";
-      const manualCatField =
-        process.env.AIRTABLE_MEMBERS_MANUAL_DISCOUNT_CATEGORY_FIELD ||
-        "Manual Discount Category";
-      const manualCheck = rec.get(manualCheckField) || "";
-      if (String(manualCheck).trim()) {
-        const manualCat = rec.get(manualCatField) || "";
-        if (String(manualCat).trim()) return manualCat;
-      }
-    } catch (_) {}
+    const manualInfo = manualOverrideInfo(rec);
+    if (manualInfo.hasOverride && manualInfo.category) return manualInfo.category;
     try {
       const expectedField =
         process.env.AIRTABLE_MEMBERS_EXPECTED_DISCOUNT_FIELD ||
@@ -2212,23 +3456,7 @@ async function buildPdfPayload({ startupRecordId, memberRecordId }) {
 
   // Check if discount is validated (either via API or manual override)
   function isDiscountValidated(rec) {
-    try {
-      const manualCheckField =
-        process.env.AIRTABLE_MEMBERS_MANUAL_OVERRIDE_FIELD ||
-        "Manual Discount Check";
-      const manualCatField =
-        process.env.AIRTABLE_MEMBERS_MANUAL_DISCOUNT_CATEGORY_FIELD ||
-        "Manual Discount Category";
-      const manualCheck = rec.get(manualCheckField) || "";
-      const manualCat = rec.get(manualCatField) || "";
-      
-      // If manual check is 'Valid' and manual category is not empty, consider validated
-      if (String(manualCheck).trim().toLowerCase() === 'valid' && String(manualCat).trim()) {
-        return true;
-      }
-    } catch (_) {}
-    
-    // Otherwise check API validation
+    if (manualOverrideInfo(rec).hasOverride) return true;
     try {
       return String(rec.get("Discount Validated") || "")
         .trim()
@@ -2307,13 +3535,17 @@ async function buildPdfPayload({ startupRecordId, memberRecordId }) {
       const teamMemberRecords =
         await listTeamMembersByStartupId(startupRecordId);
       function fullName(rec) {
-        const nameField =
-          rec.get("Name") || rec.get("Full name") || rec.get("Full Name") || "";
-        if (nameField) return String(nameField).trim();
+        const direct = rec.get("Name") || rec.get("Full name") || rec.get("Full Name");
+        if (direct) return String(direct).trim();
+        const fnStar = rec.get("First Name*") || "";
+        const lnStar = rec.get("Last Name*") || "";
+        const comboStar = (String(fnStar).trim() + " " + String(lnStar).trim()).trim();
+        if (comboStar) return comboStar;
         const first = rec.get("First Name") || "";
         const last = rec.get("Last Name") || "";
         const combo = (String(first).trim() + " " + String(last).trim()).trim();
-        return combo || "";
+        if (combo) return combo;
+        return rec.get("Team member ID") || "";
       }
       // Representative (debtor_name)
       const repRec = teamMemberRecords.find((r) =>
@@ -2336,9 +3568,9 @@ async function buildPdfPayload({ startupRecordId, memberRecordId }) {
         })
         .filter(Boolean);
 
-      // Membership counts (submitted members only, mutually exclusive buckets)
+      // Membership counts (include submitted members and any with manual override)
       const submitted = teamMemberRecords.filter((r) =>
-        asOne(r.get("New onboarding form submitted")),
+        asOne(r.get("New onboarding form submitted")) || hasManualOverride(r),
       );
       let fullNoDisc = 0,
         fullDisc = 0,
@@ -2412,7 +3644,7 @@ async function buildPdfPayload({ startupRecordId, memberRecordId }) {
             }).format(sum) +
             " per month plus GST";
         else {
-          const hasFullOrCasual = fullCount + casualCount > 0;
+          const hasFullOrCasual = (fullNoDisc + fullDisc + casualNoDisc + casualWithin + casualOver) > 0;
           calculatedMonthlyFee = hasFullOrCasual
             ? "AUD 0.00 per month (waived)"
             : "No monthly fee (Day Memberships charged per-day)";
@@ -2603,11 +3835,19 @@ function getStartupRecordIdFromReqUser(req) {
 
 async function resolveStartupRecordIdFromEOI(startupId) {
   if (!startupId) return null;
+  // Prefer resolving via the EOI linkage to avoid stale Startups IDs.
   try {
     const eoiRecord = await base(process.env.UTS_EOI_TABLE_ID).find(startupId);
     const utsStartupsField = eoiRecord.get("UTS Startups");
     if (utsStartupsField && utsStartupsField.length > 0)
       return utsStartupsField[0];
+  } catch (_) {}
+  // Fallback: treat the token's startupId as a direct Startups record id.
+  try {
+    const startupRecord = await airtableBase(
+      process.env.UTS_STARTUPS_TABLE_ID,
+    ).find(startupId);
+    if (startupRecord && startupRecord.id) return startupRecord.id;
   } catch (_) {}
   return null;
 }
@@ -2615,26 +3855,397 @@ async function resolveStartupRecordIdFromEOI(startupId) {
 // Fetch Team Members strictly by linked Startup record ID (avoid name-based cross matches)
 async function listTeamMembersByStartupId(startupRecordId) {
   if (!startupRecordId) return [];
-  const all = await base(process.env.TEAM_MEMBERS_TABLE_ID)
-    .select({ pageSize: 100 })
-    .all();
-  const isLinked = (rec) => {
-    // Prioritise common linked field names; values from linked fields are arrays of record IDs
-    const candidates = [
-      rec.get("Startup*"),
-      rec.get("Startup"),
-      rec.get("UTS Startups"),
-    ];
-    for (const v of candidates) {
-      if (
-        Array.isArray(v) &&
-        v.some((x) => String(x) === String(startupRecordId))
-      )
-        return true;
-    }
-    return false;
+  const sid = String(startupRecordId);
+  const formula = `FIND("${sid}", ARRAYJOIN({Record ID (from Startup*)}))`;
+  const fields = [
+    "Team member ID",
+    "First Name*",
+    "Last Name*",
+    "Personal email*",
+    "Mobile*",
+    "Date of birth*",
+    "Representative",
+    "New onboarding form submitted",
+    "Photo*",
+    "Membership Type",
+    "Position at startup*",
+    "What is your association to UTS?*",
+    "Team Member Status",
+  ];
+  const extraFields = [
+    process.env.AIRTABLE_MEMBERS_INTERNAL_ID_FIELD || "UTS ID",
+    process.env.AIRTABLE_MEMBERS_PRIMARY_EMAIL_FIELD || "UTS Email",
+    process.env.AIRTABLE_MEMBERS_NAME_FIELD || "Name",
+    process.env.AIRTABLE_MEMBERS_EXPECTED_DISCOUNT_FIELD ||
+      "Discount Category",
+    process.env.AIRTABLE_MEMBERS_MANUAL_OVERRIDE_FIELD ||
+      "Manual Discount Check",
+    process.env.AIRTABLE_MEMBERS_MANUAL_DISCOUNT_CATEGORY_FIELD ||
+      "Manual Discount Category",
+    process.env.AIRTABLE_MEMBERS_DOB_FIELD || "Date of birth*",
+    process.env.AIRTABLE_MEMBERS_VALIDATED_SELECT_FIELD ||
+      "Discount Validated",
+    process.env.AIRTABLE_MEMBERS_VALID_DATE_FIELD || "Discount Valid Date",
+    process.env.AIRTABLE_MEMBERS_DISCOUNT_EXPIRES_FIELD || "Discount Expires",
+    "Date of Birth",
+    "DOB",
+    "Full name",
+    "Full Name",
+    "First Name",
+    "Last Name",
+  ];
+  for (const field of extraFields) {
+    if (field && !fields.includes(field)) fields.push(field);
+  }
+  const config = {
+    filterByFormula: formula,
+    fields,
+    pageSize: 100,
+    maxRecords: 500,
   };
-  return all.filter(isLinked);
+  try {
+    const page = await base(process.env.TEAM_MEMBERS_TABLE_ID)
+      .select(config)
+      .firstPage();
+    return page || [];
+  } catch (err) {
+    if (
+      config.fields &&
+      /unknown field name/i.test(String(err && err.message))
+    ) {
+      // Retry without explicit field projection when a field is missing
+      delete config.fields;
+      const page = await base(process.env.TEAM_MEMBERS_TABLE_ID)
+        .select(config)
+        .firstPage();
+      return page || [];
+    }
+    throw err;
+  }
+}
+
+function mapTeamMemberRecord(record) {
+  if (!record) return null;
+  const attachment = record.get("Photo*");
+  let photoUrl = null;
+  if (Array.isArray(attachment) && attachment.length > 0) {
+    photoUrl = attachment[0].url || null;
+  }
+  return {
+    id: record.id,
+    name:
+      [record.get("First Name*"), record.get("Last Name*")]
+        .filter(Boolean)
+        .join(" ") || record.get("Team member ID") || "Unknown",
+    firstName: record.get("First Name*") || "",
+    lastName: record.get("Last Name*") || "",
+    email: record.get("Personal email*"),
+    mobile: record.get("Mobile*"),
+    position: record.get(MEMBER_ROLE_FIELD) || record.get("Role"),
+    representative: asOne(record.get("Representative")),
+    utsAssociation: record.get("What is your association to UTS?*"),
+    status: record.get("Team Member Status"),
+    dateOfBirth: record.get("Date of birth*"),
+    photoUrl,
+    membershipType: record.get("Membership Type") || null,
+  };
+}
+
+async function resolveStartupRecordIdForUser(user) {
+  if (!user) return null;
+  if (user.startupRecordId) return user.startupRecordId;
+  const startupId = user.startupId;
+  if (!startupId) return null;
+  try {
+    const eoiRecord = await base(process.env.UTS_EOI_TABLE_ID).find(startupId);
+    const utsStartupsField = eoiRecord.get("UTS Startups");
+    if (utsStartupsField && utsStartupsField.length > 0)
+      return utsStartupsField[0];
+  } catch (_) {}
+  try {
+    const startupRecord = await airtableBase(
+      process.env.UTS_STARTUPS_TABLE_ID,
+    ).find(startupId);
+    return startupRecord.id;
+  } catch (_) {
+    return null;
+  }
+}
+
+function hasAgentBase() {
+  return !!agentBase;
+}
+
+function normalizeSelectValue(v) {
+  if (!v) return null;
+  if (typeof v === "string") return v;
+  if (Array.isArray(v)) {
+    return v
+      .map((entry) => {
+        if (!entry) return "";
+        if (typeof entry === "string") return entry;
+        if (entry && typeof entry === "object" && entry.name) return entry.name;
+        return "";
+      })
+      .filter(Boolean)
+      .join(", ");
+  }
+  if (typeof v === "object" && v.name) return v.name;
+  return String(v);
+}
+
+// Batch agent-base helpers
+async function batchFindAgentMembersByEmails(emails) {
+  if (!hasAgentBase() || !Array.isArray(emails) || !emails.length) return [];
+  const uniq = Array.from(new Set(emails.map((e) => String(e || '').toLowerCase()).filter(Boolean)));
+  if (!uniq.length) return [];
+  const ors = uniq.map((e) => `LOWER({Personal email*}) = "${escapeAirtableString(e)}"`);
+  const filter = ors.length === 1 ? ors[0] : `OR(${ors.join(',')})`;
+  const fields = [
+    "Personal email*",
+    "Membership Type",
+    "Membership Type (old)",
+    "Membership Event History",
+    "Change Requests",
+    "Startup Id",
+  ];
+  const table = agentBase(AGENT_TEAM_MEMBERS_TABLE_ID);
+  if (!table || typeof table.select !== "function") return [];
+  const page = await table
+    .select({ filterByFormula: filter, fields, pageSize: 100, maxRecords: 500 })
+    .firstPage();
+  return page || [];
+}
+
+async function fetchAgentRecordsByIds(tableId, ids, limit = 50) {
+  if (!hasAgentBase() || !Array.isArray(ids) || !ids.length) return [];
+  const slice = Array.from(new Set(ids)).slice(0, limit);
+  const ors = slice.map((id) => `RECORD_ID() = '${escapeAirtableString(id)}'`);
+  const filter = ors.length === 1 ? ors[0] : `OR(${ors.join(',')})`;
+  const page = await agentBase(tableId)
+    .select({ filterByFormula: filter, pageSize: 100, maxRecords: limit })
+    .firstPage();
+  return page || [];
+}
+
+async function fetchLinkedAgentRecords(ids, tableId, limit = 3) {
+  if (!hasAgentBase() || !Array.isArray(ids) || !ids.length) return [];
+  const slice = ids.slice(-limit).reverse();
+  const recs = await Promise.all(
+    slice.map((id) =>
+      agentBase(tableId)
+        .find(id)
+        .catch(() => null),
+    ),
+  );
+  return recs.filter(Boolean);
+}
+
+async function resolvePortalStartupIdsForEmails(emails) {
+  if (!hasAgentBase() || !Array.isArray(emails) || !emails.length) return [];
+  try {
+    const records = await batchFindAgentMembersByEmails(emails);
+    const ids = new Set();
+    for (const rec of records) {
+      const fromLookup = rec.get("Startup Id");
+      if (Array.isArray(fromLookup)) {
+        fromLookup.forEach((val) => {
+          if (val) ids.add(String(val));
+        });
+      } else if (fromLookup) {
+        ids.add(String(fromLookup));
+      }
+    }
+    return Array.from(ids);
+  } catch (e) {
+    log("warn", "agent.startup_ids.error", { message: e?.message });
+    return [];
+  }
+}
+
+async function resolveAgentStartupIdsForPortal(portalIds) {
+  if (
+    !hasAgentBase() ||
+    !AGENT_UTS_STARTUPS_TABLE_ID ||
+    !Array.isArray(portalIds) ||
+    !portalIds.length
+  )
+    return [];
+  try {
+    const table = agentBase(AGENT_UTS_STARTUPS_TABLE_ID);
+    if (!table || typeof table.select !== "function") return [];
+    const ors = portalIds
+      .map((id) => String(id || "").trim())
+      .filter(Boolean)
+      .map((id) => `{Record ID} = "${escapeAirtableString(id)}"`);
+    if (!ors.length) return [];
+    const filter = ors.length === 1 ? ors[0] : `OR(${ors.join(",")})`;
+    const records = await table
+      .select({ filterByFormula: filter, fields: [], maxRecords: 50 })
+      .firstPage();
+    return (records || []).map((rec) => rec.id);
+  } catch (e) {
+    log("warn", "agent.portal_lookup.error", {
+      message: e?.message,
+      portalIds,
+    });
+    return [];
+  }
+}
+
+let agentMembershipTypesCache = null;
+let agentMembershipTypesCacheTs = 0;
+const AGENT_TYPES_CACHE_MS = 5 * 60 * 1000;
+async function getAgentMembershipTypes() {
+  if (!hasAgentBase()) return [];
+  const now = Date.now();
+  if (
+    agentMembershipTypesCache &&
+    now - agentMembershipTypesCacheTs < AGENT_TYPES_CACHE_MS
+  ) {
+    return agentMembershipTypesCache;
+  }
+  const records = await agentBase(AGENT_MEMBERSHIP_TYPES_TABLE_ID)
+    .select({ maxRecords: 100 })
+    .all();
+  agentMembershipTypesCache =
+    records?.map((rec) => ({
+      id: rec.id,
+      name: rec.get("Membership Type") || "Unnamed Type",
+    })) || [];
+  agentMembershipTypesCacheTs = now;
+  return agentMembershipTypesCache;
+}
+
+async function buildManagementData(teamMembers) {
+  if (!hasAgentBase() || !Array.isArray(teamMembers) || !teamMembers.length) {
+    return { enabled: false, members: [], events: [], changeRequests: [] };
+  }
+  const emails = teamMembers.map((m) => m.email).filter(Boolean);
+  const agentMembers = hasAgentBase()
+    ? await batchFindAgentMembersByEmails(emails)
+    : [];
+  const byEmail = new Map(
+    agentMembers.map((r) => [String(r.get("Personal email*") || '').toLowerCase(), r]),
+  );
+
+  const managementMembers = [];
+  const eventIdBag = [];
+  const requestIdBag = [];
+  for (const member of teamMembers) {
+    const agentRec = byEmail.get(String(member.email || '').toLowerCase());
+    const fields = (agentRec && agentRec.fields) || {};
+    const agentRecordId = agentRec ? agentRec.id : null;
+    const summary = {
+      primaryId: member.id,
+      agentRecordId,
+      name: member.name,
+      firstName: member.firstName,
+      lastName: member.lastName,
+      email: member.email,
+      mobile: member.mobile,
+      dateOfBirth: member.dateOfBirth,
+      photoUrl: member.photoUrl,
+      membershipType: member.membershipType || normalizeSelectValue(fields["Membership Type"]),
+      membershipTypeOld: normalizeSelectValue(fields["Membership Type (old)"]),
+      representative: member.representative,
+      status: member.status || null,
+    };
+    managementMembers.push(summary);
+    if (agentRecordId) {
+      const eids = Array.isArray(fields["Membership Event History"]) ? fields["Membership Event History"] : [];
+      const rids = Array.isArray(fields["Change Requests"]) ? fields["Change Requests"] : [];
+      eventIdBag.push(...eids);
+      requestIdBag.push(...rids);
+    }
+  }
+
+  // Map agent member IDs to names for event rendering
+  const agentIdToName = new Map();
+  managementMembers.forEach((m) => {
+    if (m.agentRecordId) agentIdToName.set(m.agentRecordId, m.name || '');
+  });
+
+  const aggregatedEvents = [];
+  const aggregatedRequests = [];
+  if (eventIdBag.length) {
+    const eventRecs = await fetchAgentRecordsByIds(
+      AGENT_MEMBERSHIP_EVENTS_TABLE_ID,
+      eventIdBag,
+      50,
+    );
+    eventRecs.forEach((rec) => {
+      const linkedMembers = Array.isArray(rec.get("Member"))
+        ? rec.get("Member")
+        : [];
+      const linkedId = linkedMembers && linkedMembers.length ? linkedMembers[0] : null;
+      const memberName =
+        (linkedId && agentIdToName.get(linkedId)) ||
+        normalizeSelectValue(rec.get("Member Name")) ||
+        "";
+      aggregatedEvents.push({
+        id: rec.id,
+        memberName,
+        attribute: normalizeSelectValue(rec.get("Attribute")),
+        fromValue: rec.get("From Value") || "",
+        toValue: rec.get("To Value") || "",
+        effectiveAt:
+          rec.get("Effective At") || rec.get("Applies On (Sydney)") || null,
+        source: normalizeSelectValue(rec.get("Source")),
+        reason: rec.get("Reason") || "",
+      });
+    });
+  }
+  if (requestIdBag.length) {
+    const reqRecs = await fetchAgentRecordsByIds(
+      AGENT_CHANGE_REQUESTS_TABLE_ID,
+      requestIdBag,
+      50,
+    );
+    reqRecs.forEach((rec) => {
+      aggregatedRequests.push({
+        id: rec.id,
+        memberName: '',
+        attribute: normalizeSelectValue(rec.get("Attribute")),
+        requestedValue: rec.get("Requested To") || "",
+        decision: normalizeSelectValue(rec.get("Decision")),
+        requestedAt: rec.get("Requested At") || null,
+        proposedEffectiveAt: rec.get("Proposed Effective At") || null,
+      });
+    });
+  }
+
+  const membershipTypes = await getAgentMembershipTypes();
+  const summary = {
+    totalMembers: managementMembers.length,
+    membershipsAssigned: managementMembers.filter((m) => !!m.membershipType)
+      .length,
+    pendingRequests: aggregatedRequests.filter(
+      (req) => !req.decision || req.decision === "Pending",
+    ).length,
+    recentEvents: aggregatedEvents.length,
+  };
+
+  aggregatedEvents.sort((a, b) => {
+    const tsA = a.effectiveAt ? Date.parse(a.effectiveAt) : 0;
+    const tsB = b.effectiveAt ? Date.parse(b.effectiveAt) : 0;
+    return tsB - tsA;
+  });
+
+  aggregatedRequests.sort((a, b) => {
+    const tsA = a.requestedAt ? Date.parse(a.requestedAt) : 0;
+    const tsB = b.requestedAt ? Date.parse(b.requestedAt) : 0;
+    return tsB - tsA;
+  });
+
+  return {
+    enabled: true,
+    summary,
+    membershipTypes,
+    members: managementMembers,
+    events: aggregatedEvents.slice(0, 20),
+    changeRequests: aggregatedRequests.slice(0, 10),
+  };
 }
 
 async function fetchStartupAndMembers(startupRecordId) {
@@ -2662,6 +4273,273 @@ function getField(rec, name) {
   return String(v);
 }
 
+const financialCache = new Map();
+
+function parseCurrencyValue(value) {
+  if (typeof value === "number") return value;
+  if (value == null) return null;
+  const num = Number(String(value).replace(/[^0-9.-]/g, ""));
+  return Number.isFinite(num) ? num : null;
+}
+
+async function resolveStartupLookup(startupRecordId, agentStartupIds = []) {
+  const normalizedAgentIds = Array.isArray(agentStartupIds)
+    ? Array.from(
+        new Set(
+          agentStartupIds
+            .map((id) => (id == null ? null : String(id)))
+            .filter(Boolean),
+        ),
+      )
+    : [];
+  const startupNames = new Set();
+  if (normalizedAgentIds.length) {
+    const startupRecords = await fetchAgentRecordsByIds(
+      AGENT_UTS_STARTUPS_TABLE_ID,
+      normalizedAgentIds,
+      50,
+    );
+    for (const rec of startupRecords) {
+      const name =
+        rec.get("Startup Name") ||
+        rec.get("Startup Name*") ||
+        rec.get("Registered Business Name");
+      if (name) startupNames.add(String(name).trim());
+    }
+  }
+  if (startupRecordId) {
+    try {
+      const portalRecord = await airtableBase(
+        process.env.UTS_STARTUPS_TABLE_ID,
+      ).find(startupRecordId);
+      [
+        portalRecord.get("Startup Name (or working title)"),
+        portalRecord.get("Startup Name"),
+        portalRecord.get("Registered Business Name"),
+      ]
+        .map((val) => (val == null ? "" : String(val).trim()))
+        .filter(Boolean)
+        .forEach((name) => startupNames.add(name));
+    } catch (_) {}
+  }
+  return { agentIds: normalizedAgentIds, names: startupNames };
+}
+
+function getEntrySortValue(entry) {
+  if (!entry) return 0;
+  const candidates = [entry.timestamp, entry.date, entry.billingPeriod];
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    const ts = Date.parse(candidate);
+    if (Number.isFinite(ts)) return ts;
+  }
+  return 0;
+}
+
+async function fetchFinancialTransactionsForStartup(
+  startupRecordId,
+  agentStartupIds = [],
+  startupIdentity = null,
+) {
+  if (!hasAgentBase() || !startupRecordId) return [];
+  const identity =
+    startupIdentity ||
+    (await resolveStartupLookup(startupRecordId, agentStartupIds));
+  const normalizedAgentIds = Array.isArray(identity?.agentIds)
+    ? identity.agentIds
+    : [];
+  const startupNames =
+    identity && identity.names instanceof Set
+      ? identity.names
+      : new Set(identity?.names || []);
+  const cacheKeyParts = [String(startupRecordId)];
+  if (normalizedAgentIds.length) {
+    cacheKeyParts.push(normalizedAgentIds.join(","));
+  }
+  const cacheKey = cacheKeyParts.join("|");
+  const cached = financialCache.get(cacheKey);
+  if (
+    cached &&
+    Date.now() - cached.ts < Math.max(FINANCIAL_TRANSACTIONS_CACHE_MS, 0)
+  ) {
+    return cached.data;
+  }
+  const table = agentBase(AGENT_FINANCIAL_TRANSACTIONS_TABLE_ID);
+  if (!table || typeof table.select !== "function") return [];
+
+  if (!startupNames.size) return [];
+
+  const nameFilters = Array.from(startupNames).map(
+    (name) => `{Startup} = "${escapeAirtableString(name)}"`,
+  );
+  const filter =
+    nameFilters.length === 1
+      ? nameFilters[0]
+      : `OR(${nameFilters.join(",")})`;
+  const maxPageSize = Math.min(
+    Math.max(FINANCIAL_TRANSACTIONS_LIMIT, 1),
+    100,
+  );
+  const agentIdSet = new Set(normalizedAgentIds);
+  const records = await table
+    .select({
+      filterByFormula: filter,
+      sort: [{ field: "Timestamp", direction: "desc" }],
+      pageSize: maxPageSize,
+      fields: [
+        "Startup",
+        "Timestamp",
+        "Type",
+        "Description",
+        "Related Booking",
+        "Related Giveback",
+        "Related Locker Assignment",
+        "Source Record (Membership Staging)",
+        "Date",
+        "Debit Amount",
+        "Credit Amount",
+        "Billing Period",
+        "Notes",
+      ],
+    })
+    .firstPage();
+  const scopedRecords = agentIdSet.size
+    ? (records || []).filter((rec) => {
+        const linked = rec.get("Startup");
+        if (!Array.isArray(linked) || !linked.length) return false;
+        return linked.some((id) => agentIdSet.has(String(id)));
+      })
+    : records || [];
+  const entries = scopedRecords.map((rec) => ({
+    id: rec.id,
+    timestamp: getField(rec, "Timestamp"),
+    date: getField(rec, "Date"),
+    type: getField(rec, "Type"),
+    description: getField(rec, "Description"),
+    debitAmount: parseCurrencyValue(rec.get("Debit Amount")),
+    creditAmount: parseCurrencyValue(rec.get("Credit Amount")),
+    billingPeriod: getField(rec, "Billing Period"),
+    notes: getField(rec, "Notes"),
+    related: {
+      bookings: rec.get("Related Booking") || [],
+      givebacks: rec.get("Related Giveback") || [],
+      lockerAssignments: rec.get("Related Locker Assignment") || [],
+      membershipStaging:
+        rec.get("Source Record (Membership Staging)") || [],
+    },
+  }));
+  financialCache.set(cacheKey, { ts: Date.now(), data: entries });
+  return entries;
+}
+
+async function fetchMembershipTransactionsForStartup(
+  startupRecordId,
+  agentStartupIds = [],
+  startupIdentity = null,
+) {
+  if (
+    !hasAgentBase() ||
+    !AGENT_MEMBERSHIP_EXPORT_TABLE_ID ||
+    !startupRecordId
+  )
+    return [];
+  const identity =
+    startupIdentity ||
+    (await resolveStartupLookup(startupRecordId, agentStartupIds));
+  const agentIds = Array.isArray(identity?.agentIds) ? identity.agentIds : [];
+  const agentIdSet = new Set(agentIds);
+  const startupNames =
+    identity && identity.names instanceof Set
+      ? identity.names
+      : new Set(identity?.names || []);
+  const normalizedNames = Array.from(startupNames)
+    .map((name) => String(name || "").trim().toLowerCase())
+    .filter(Boolean);
+  const table = agentBase(AGENT_MEMBERSHIP_EXPORT_TABLE_ID);
+  if (!table || typeof table.select !== "function") return [];
+  const nameFilters = normalizedNames.map(
+    (name) => `LOWER({Startup Name}) = "${escapeAirtableString(name)}"`,
+  );
+  let filter = null;
+  const linkPresenceFormula = 'ARRAYJOIN({Startup}) != ""';
+  if (agentIdSet.size && nameFilters.length) {
+    const joined =
+      nameFilters.length === 1
+        ? nameFilters[0]
+        : `OR(${nameFilters.join(",")})`;
+    filter = `AND(${linkPresenceFormula}, ${joined})`;
+  } else if (nameFilters.length) {
+    filter =
+      nameFilters.length === 1
+        ? nameFilters[0]
+        : `OR(${nameFilters.join(",")})`;
+  } else if (agentIdSet.size) {
+    filter = linkPresenceFormula;
+  }
+  if (!filter) return [];
+  const records = await table
+    .select({
+      filterByFormula: filter,
+      sort: [{ field: "Created", direction: "desc" }],
+      pageSize: 100,
+      fields: [
+        "Startup",
+        "Startup Name",
+        "Line item description",
+        "Line charge ex. GST",
+        "Period",
+        "Created",
+        "Unique Key",
+        "Agreement Signee Email",
+        "Accounts Payable Email",
+      ],
+    })
+    .firstPage();
+  const normalizedNameSet = new Set(normalizedNames);
+  const scopedRecords = (records || []).filter((rec) => {
+    const linked = rec.get("Startup");
+    if (
+      agentIdSet.size &&
+      Array.isArray(linked) &&
+      linked.some((id) => agentIdSet.has(String(id)))
+    ) {
+      return true;
+    }
+    if (!normalizedNameSet.size) return true;
+    const rawName = String(rec.get("Startup Name") || "")
+      .trim()
+      .toLowerCase();
+    return normalizedNameSet.has(rawName);
+  });
+  return scopedRecords.map((rec) => {
+    const amount = parseCurrencyValue(rec.get("Line charge ex. GST"));
+    const period = rec.get("Period") || "";
+    const description =
+      rec.get("Line item description") ||
+      `Membership charge ${period}`.trim();
+    const uniqueKey = rec.get("Unique Key");
+    const timestamp = getField(rec, "Created");
+    const derivedDate = period && !timestamp ? period : timestamp;
+    return {
+      id: rec.id,
+      timestamp,
+      date: derivedDate,
+      type: "Membership Charge",
+      description,
+      debitAmount: amount,
+      creditAmount: null,
+      billingPeriod: period || "",
+      notes: "",
+      related: {
+        bookings: [],
+        givebacks: [],
+        lockerAssignments: [],
+        membershipStaging: uniqueKey ? [uniqueKey] : [],
+      },
+    };
+  });
+}
+
 // ------------------------------
 // Public status mapping + job sanitizer
 // ------------------------------
@@ -2678,10 +4556,10 @@ function mapReason(internal) {
       return { code: "unauthorized", message: "Authorization is required" };
     if (s === "not_found")
       return { code: "not_found", message: "No matching record found" };
-    if (s === "invalid" || s === "mismatch")
+  if (s === "invalid" || s === "mismatch")
       return { code: "mismatch", message: "Does not match records" };
-    if (s === "error") return { code: "error", message: "Validation error" };
-    if (s === "skipped" || s === "no_request")
+  if (s === "error") return { code: "error", message: "Validation error" };
+  if (s === "skipped" || s === "no_request")
       return { code: "no_request", message: "No discount requested" };
     if (s === "manual" || s === "manual_override")
       return { code: "manual", message: "Manual check override" };
@@ -2734,6 +4612,7 @@ function sanitizeJob(job) {
 async function runMemberValidationsSequential(
   members,
   { updateAirtable = true, onUpdate = null } = {},
+  req = null,
 ) {
   const validator = require("./validation_generation/validation/blackbaudDiscountValidator");
   const devFake =
@@ -2746,6 +4625,11 @@ async function runMemberValidationsSequential(
           process.env.SKY_SUBSCRIPTION_KEY_PRIMARY)
       ));
   const results = [];
+  const PACE_MS = parseInt(
+    process.env.VALIDATION_PACING_MS || (DEV_MODE ? '0' : '250'),
+    10,
+  );
+  const t0All = Date.now();
   for (let i = 0; i < members.length; i++) {
     const r = members[i];
     // Mark as pending for UI
@@ -2768,21 +4652,21 @@ async function runMemberValidationsSequential(
         process.env.AIRTABLE_MEMBERS_EXPECTED_DISCOUNT_FIELD ||
           "Discount Category",
       ) || "";
-    const manual =
-      getField(
-        r,
-        process.env.AIRTABLE_MEMBERS_MANUAL_OVERRIDE_FIELD ||
-          "Manual Discount Check",
-      ) || "";
-    if (String(manual).trim()) {
-      const manualCat =
-        getField(
-          r,
-          process.env.AIRTABLE_MEMBERS_MANUAL_DISCOUNT_CATEGORY_FIELD ||
-            "Manual Discount Category",
-        ) || "";
-      if (String(manualCat).trim()) expected = manualCat;
-    }
+    const manualInfo = manualOverrideInfo(r);
+    const manualApplied = manualInfo.hasOverride && manualInfo.category;
+    if (manualApplied) expected = manualInfo.category;
+    log(
+      "debug",
+      "validation.member.context",
+      {
+        memberId: r.id,
+        searchIdPresent: !!search_id,
+        manualApplied,
+        manualCategory: manualInfo.category || null,
+        expected,
+      },
+      req,
+    );
     const email =
       getField(
         r,
@@ -2799,7 +4683,13 @@ async function runMemberValidationsSequential(
       "";
 
     // Manual override present: bypass validation and keep record as-is
-    if (String(manual).trim()) {
+    if (manualInfo.hasOverride) {
+      log(
+        "info",
+        "validation.member.manual_override",
+        { memberId: r.id, manualCategory: manualInfo.category || null },
+        req,
+      );
       if (typeof onUpdate === "function") {
         try {
           onUpdate(r.id, {
@@ -2819,6 +4709,12 @@ async function runMemberValidationsSequential(
 
     // Skip when no discount requested
     if (!hasDiscountRequest(expected)) {
+      log(
+        "info",
+        "validation.member.no_request",
+        { memberId: r.id, expected },
+        req,
+      );
       if (typeof onUpdate === "function") {
         try {
           onUpdate(r.id, {
@@ -2837,10 +4733,15 @@ async function runMemberValidationsSequential(
     }
 
     if (!search_id) {
-      log("warn", "validation.member.skip", {
-        memberId: r.id,
-        reason: "missing search_id",
-      });
+      log(
+        "warn",
+        "validation.member.skip",
+        {
+          memberId: r.id,
+          reason: "missing search_id",
+        },
+        req,
+      );
       results.push({
         memberId: r.id,
         skipped: true,
@@ -2850,6 +4751,7 @@ async function runMemberValidationsSequential(
     }
 
     let result;
+    const t0 = Date.now();
     if (devFake) {
       const bucket = expected || "Current UTS Staff";
       result = {
@@ -2866,16 +4768,36 @@ async function runMemberValidationsSequential(
         alumni_expires_at: null,
       };
     } else {
-      log("debug", "validation.member.start", {
-        memberId: r.id,
-        expected,
-        hasEmail: !!email,
-        hasDOB: !!dob,
-      });
-      result = await validator.validateDiscount(
-        { search_id, expected_bucket: expected, email, name, dob },
-        { debug: false },
+      log(
+        "debug",
+        "validation.member.start",
+        {
+          memberId: r.id,
+          expected,
+          hasEmail: !!email,
+          hasDOB: !!dob,
+        },
+        req,
       );
+      try {
+        result = await validator.validateDiscount(
+          { search_id, expected_bucket: expected, email, name, dob },
+          { debug: false },
+        );
+      } catch (e) {
+        log(
+          "error",
+          "validation.member.exception",
+          { memberId: r.id, message: e?.message, expected, search_id },
+          req,
+        );
+        result = {
+          valid: false,
+          status: "error",
+          reason: e?.message || "validator_exception",
+          primary_bucket: null,
+        };
+      }
       // Attempt token refresh once on 401
       if (
         (result &&
@@ -2893,10 +4815,25 @@ async function runMemberValidationsSequential(
               require("dotenv").config({ override: true });
             }
           } catch (_) {}
-          result = await validator.validateDiscount(
-            { search_id, expected_bucket: expected, email, name, dob },
-            { debug: false },
-          );
+          try {
+            result = await validator.validateDiscount(
+              { search_id, expected_bucket: expected, email, name, dob },
+              { debug: false },
+            );
+          } catch (e) {
+            log(
+              "error",
+              "validation.member.exception_retry",
+              { memberId: r.id, message: e?.message, expected, search_id },
+              req,
+            );
+            result = {
+              valid: false,
+              status: "error",
+              reason: e?.message || "validator_exception",
+              primary_bucket: null,
+            };
+          }
         }
       }
     }
@@ -2924,16 +4861,281 @@ async function runMemberValidationsSequential(
       } catch (_) {}
     }
     results.push({ memberId: r.id, result, airtableUpdate });
-    log("info", "validation.member.result", {
-      memberId: r.id,
-      status: result.status,
-      valid: result.valid,
-      primary_bucket: result.primary_bucket,
-    });
-    // small pacing delay to be gentle on SKY
-    await new Promise((res) => setTimeout(res, 250));
+    if (String(result?.status || "").toLowerCase() === "error") {
+      log(
+        "error",
+        "validation.member.error",
+        {
+          memberId: r.id,
+          expected,
+          search_id,
+          reason: result?.reason || result?.reason_message || null,
+        },
+        req,
+      );
+    }
+    log(
+      "info",
+      "validation.member.result",
+      {
+        memberId: r.id,
+        status: result.status,
+        valid: result.valid,
+        primary_bucket: result.primary_bucket,
+        expected,
+        manualApplied,
+        ms: Date.now() - t0,
+      },
+      req,
+    );
+    // pacing delay to be gentle on SKY (configurable; fast in dev)
+    if (PACE_MS > 0) await new Promise((res) => setTimeout(res, PACE_MS));
   }
+  log(
+    "info",
+    "validation.all.done",
+    { count: results.length, ms: Date.now() - t0All },
+    req,
+  );
   return results;
+}
+
+async function startValidationAndPdfJob(startupRecordId, req) {
+  if (!startupRecordId) {
+    return {
+      ok: false,
+      status: 400,
+      message: "No linked UTS Startups record found for this token.",
+    };
+  }
+
+  const existing = JOBS.get(startupRecordId);
+  if (existing && existing.state === "running") {
+    log("info", "orchestrator.already_running", { startupRecordId }, req);
+    return {
+      ok: true,
+      alreadyRunning: true,
+      job: existing,
+    };
+  }
+
+  const job = {
+    state: "running",
+    startedAt: new Date().toISOString(),
+    progress: { validated: 0, total: 0 },
+    result: null,
+  };
+  JOBS.set(startupRecordId, job);
+
+  (async () => {
+    try {
+      // Fetch startup + members
+      const { startupRec, startupName, members } =
+        await fetchStartupAndMembers(startupRecordId);
+      log(
+        "info",
+        "orchestrator.start",
+        { startupRecordId, startupName, members: members.length },
+        req,
+      );
+      job.progress.total = members.length;
+
+      const startupFormSubmitted =
+        asOne(startupRec.get("New onboarding form submitted")) ||
+        asOne(startupRec.get("Onboarding Submitted"));
+      // Seed member checklist for UI
+      function fullName(r) {
+        const direct =
+          r.get("Name") || r.get("Full name") || r.get("Full Name");
+        if (direct) return String(direct).trim();
+        const fnStar = r.get("First Name*") || "";
+        const lnStar = r.get("Last Name*") || "";
+        const comboStar = (String(fnStar).trim() + " " + String(lnStar).trim()).trim();
+        if (comboStar) return comboStar;
+        const fn = r.get("First Name") || "";
+        const ln = r.get("Last Name") || "";
+        const combo = (String(fn).trim() + " " + String(ln).trim()).trim();
+        if (combo) return combo;
+        return r.get("Team member ID") || "";
+      }
+      job.members = (members || []).map((r) => {
+        const manualInfo = manualOverrideInfo(r);
+        return {
+          id: r.id,
+          name: fullName(r) || r.id,
+          type: r.get("Membership Type") || "",
+          expected_bucket: (function () {
+            if (manualInfo.hasOverride && manualInfo.category)
+              return manualInfo.category;
+            try {
+              return (
+                r.get(
+                  process.env.AIRTABLE_MEMBERS_EXPECTED_DISCOUNT_FIELD ||
+                    "Discount Category",
+                ) || ""
+              );
+            } catch (_) {}
+            return "";
+          })(),
+          status: "queued",
+          primary_bucket: null,
+          reason: "",
+        };
+      });
+      const submissionConfirmation = asOne(
+        startupRec.get("Submission Confirmation"),
+      );
+      const anyRepSubmitted = members.some(
+        (m) =>
+          asOne(m.get("Representative")) &&
+          asOne(m.get("New onboarding form submitted")),
+      );
+      log(
+        "debug",
+        "orchestrator.gates",
+        { startupFormSubmitted, submissionConfirmation, anyRepSubmitted },
+        req,
+      );
+      if (
+        !(startupFormSubmitted && submissionConfirmation && anyRepSubmitted)
+      ) {
+        job.state = "blocked";
+        job.result = {
+          reason: "eligibility",
+          details: {
+            startupFormSubmitted,
+            submissionConfirmation,
+            anyRepSubmitted,
+          },
+        };
+        job.finishedAt = new Date().toISOString();
+        log("warn", "orchestrator.blocked", job.result.details, req);
+        return;
+      }
+
+      // Run validations with live updates
+      const t0Val = Date.now();
+      const results = await runMemberValidationsSequential(
+        members,
+        {
+          updateAirtable: true,
+          onUpdate: (memberId, partial) => {
+            const m = (job.members || []).find((x) => x.id === memberId);
+            if (!m) return;
+            if (partial.status) m.status = partial.status;
+            if (partial.reason_code) m.reason_code = partial.reason_code;
+            if (partial.reason_message)
+              m.reason_message = partial.reason_message;
+            if (
+              ["valid", "invalid", "ambiguous", "error", "skipped"].includes(
+                String(partial.status || "").toLowerCase(),
+              )
+            ) {
+              job.progress.validated = Math.min(
+                (job.progress.validated || 0) + 1,
+                job.progress.total || 0,
+              );
+            }
+          },
+        },
+        req,
+      );
+      log(
+        'info',
+        'orchestrator.validations.done',
+        { count: results.length, ms: Date.now() - t0Val },
+        req,
+      );
+
+      // Build minimal payload and generate PDF
+      const payload = await buildPdfPayload({ startupRecordId });
+      const filename = suggestPdfFilename(
+        payload?.legal_name || startupName || "agreement",
+      );
+      const t0Pdf = Date.now();
+      log("info", "orchestrator.pdf.start", { filename }, req);
+      const pdfBuffer = await generatePdfBuffer(payload);
+      log('info', 'orchestrator.pdf.done', { filename, ms: Date.now() - t0Pdf }, req);
+
+      // Cache and issue a one-time URL for Airtable attach (user will get a stable redirect URL)
+      const tmpDir = path.join(os.tmpdir(), "pdf-cache");
+      await fs.ensureDir(tmpDir);
+      const tokenAirtable = crypto.randomBytes(12).toString("hex");
+      const filePathA = path.join(tmpDir, `${tokenAirtable}.pdf`);
+      await fs.writeFile(filePathA, pdfBuffer);
+      const expiresAt = new Date(Date.now() + URL_TTL_SECONDS * 1000);
+      PDF_TOKENS.set(tokenAirtable, {
+        filePath: filePathA,
+        expiresAt,
+        filename,
+      });
+
+      // Attach to Airtable Startups 'Agreement' field (append)
+      try {
+        const t0Attach = Date.now();
+        const existingAttachments = Array.isArray(startupRec.get("Agreement"))
+          ? startupRec.get("Agreement")
+          : [];
+        const keep = existingAttachments
+          .map((att) => (att && att.id ? { id: att.id } : null))
+          .filter(Boolean);
+        const attachment = {
+          url: `${pdfBaseUrl(req)}/download/${tokenAirtable}`,
+          filename,
+        };
+        await airtableBase(process.env.UTS_STARTUPS_TABLE_ID).update(
+          startupRecordId,
+          { Agreement: [...keep, attachment], 'Agreement Created Date': ymd() },
+        );
+        log(
+          "info",
+          "orchestrator.attach.ok",
+          { startupRecordId, countBefore: keep.length, filename, ms: Date.now() - t0Attach },
+          req,
+        );
+      } catch (e) {
+        log(
+          "warn",
+          "orchestrator.attach.error",
+          { message: e.message },
+          req,
+        );
+      }
+
+      if (DEV_MODE) {
+        try {
+          const outdir =
+            process.env.PDF_OUTDIR ||
+            path.join(process.cwd(), "out", "pdfs");
+          await fs.ensureDir(outdir);
+          await fs.writeFile(path.join(outdir, filename), pdfBuffer);
+        } catch (e) {
+          /* ignore */
+        }
+      }
+
+      job.state = "done";
+      const stableUrl = `${pdfBaseUrl(req)}/agreement/latest/${req.params?.token || ""}`;
+      job.result = {
+        pdf: { url: stableUrl, filename },
+        validations: results,
+      };
+      job.finishedAt = new Date().toISOString();
+      log(
+        "info",
+        "orchestrator.done",
+        { filename, expiresAt: expiresAt.toISOString() },
+        req,
+      );
+    } catch (e) {
+      log("error", "orchestrator.exception", { message: e.message }, req);
+      job.state = "error";
+      job.result = { message: e.message };
+      job.finishedAt = new Date().toISOString();
+    }
+  })();
+
+  return { ok: true, alreadyRunning: false, job };
 }
 
 app.post(
@@ -2942,264 +5144,29 @@ app.post(
   verifyToken,
   async (req, res) => {
     try {
-      // Resolve startup record id (prefer EOI link over token to avoid stale IDs)
       let startupRecordId = await resolveStartupRecordIdFromEOI(
         req.user?.startupId,
       );
       if (!startupRecordId)
         startupRecordId = getStartupRecordIdFromReqUser(req);
-      if (!startupRecordId)
-        return res.status(400).json({
-          success: false,
-          message: "No linked UTS Startups record found for this token.",
-        });
 
-      const existing = JOBS.get(startupRecordId);
-      if (existing && existing.state === "running") {
-        log("info", "orchestrator.already_running", { startupRecordId }, req);
-        return res.status(202).json({
-          success: true,
-          message: "Validation/generation already in progress",
-          job: {
-            state: existing.state,
-            startedAt: existing.startedAt,
-            progress: existing.progress,
-          },
-        });
+      const result = await startValidationAndPdfJob(startupRecordId, req);
+      if (!result.ok) {
+        return res
+          .status(result.status || 500)
+          .json({ success: false, message: result.message });
       }
 
-      // Create new job entry
-      const job = {
-        state: "running",
-        startedAt: new Date().toISOString(),
-        progress: { validated: 0, total: 0 },
-        result: null,
-      };
-      JOBS.set(startupRecordId, job);
-
-      (async () => {
-        try {
-          // Fetch startup + members
-          const { startupRec, startupName, members } =
-            await fetchStartupAndMembers(startupRecordId);
-          log(
-            "info",
-            "orchestrator.start",
-            { startupRecordId, startupName, members: members.length },
-            req,
-          );
-          job.progress.total = members.length;
-
-          const startupFormSubmitted =
-            asOne(startupRec.get("New onboarding form submitted")) ||
-            asOne(startupRec.get("Onboarding Submitted"));
-          // Seed member checklist for UI
-          function fullName(r) {
-            const n = (
-              r.get("Name") ||
-              r.get("Full name") ||
-              r.get("Full Name") ||
-              ""
-            )
-              .toString()
-              .trim();
-            if (n) return n;
-            const fn = r.get("First Name") || "";
-            const ln = r.get("Last Name") || "";
-            return (String(fn).trim() + " " + String(ln).trim()).trim();
-          }
-          job.members = (members || []).map((r) => ({
-            id: r.id,
-            name: fullName(r) || r.id,
-            type: r.get("Membership Type") || "",
-            expected_bucket: (function () {
-              try {
-                const manualCheckField =
-                  process.env.AIRTABLE_MEMBERS_MANUAL_OVERRIDE_FIELD ||
-                  "Manual Discount Check";
-                const manualCatField =
-                  process.env.AIRTABLE_MEMBERS_MANUAL_DISCOUNT_CATEGORY_FIELD ||
-                  "Manual Discount Category";
-                const manualCheck = r.get(manualCheckField) || "";
-                if (String(manualCheck).trim()) {
-                  const manualCat = r.get(manualCatField) || "";
-                  if (String(manualCat).trim()) return manualCat;
-                }
-              } catch (_) {}
-              try {
-                return (
-                  r.get(
-                    process.env.AIRTABLE_MEMBERS_EXPECTED_DISCOUNT_FIELD ||
-                      "Discount Category",
-                  ) || ""
-                );
-              } catch (_) {}
-              return "";
-            })(),
-            status: "queued",
-            primary_bucket: null,
-            reason: "",
-          }));
-          const submissionConfirmation = asOne(
-            startupRec.get("Submission Confirmation"),
-          );
-          const anyRepSubmitted = members.some(
-            (m) =>
-              asOne(m.get("Representative")) &&
-              asOne(m.get("New onboarding form submitted")),
-          );
-          log(
-            "debug",
-            "orchestrator.gates",
-            { startupFormSubmitted, submissionConfirmation, anyRepSubmitted },
-            req,
-          );
-          if (
-            !(startupFormSubmitted && submissionConfirmation && anyRepSubmitted)
-          ) {
-            job.state = "blocked";
-            job.result = {
-              reason: "eligibility",
-              details: {
-                startupFormSubmitted,
-                submissionConfirmation,
-                anyRepSubmitted,
-              },
-            };
-            job.finishedAt = new Date().toISOString();
-            log("warn", "orchestrator.blocked", job.result.details, req);
-            return;
-          }
-
-          // Run validations with live updates
-          const results = await runMemberValidationsSequential(members, {
-            updateAirtable: true,
-            onUpdate: (memberId, partial) => {
-              const m = (job.members || []).find((x) => x.id === memberId);
-              if (!m) return;
-              if (partial.status) m.status = partial.status;
-              if (partial.reason_code) m.reason_code = partial.reason_code;
-              if (partial.reason_message)
-                m.reason_message = partial.reason_message;
-              if (
-                ["valid", "invalid", "ambiguous", "error", "skipped"].includes(
-                  String(partial.status || "").toLowerCase(),
-                )
-              ) {
-                job.progress.validated = Math.min(
-                  (job.progress.validated || 0) + 1,
-                  job.progress.total || 0,
-                );
-              }
-            },
-          });
-          log(
-            "info",
-            "orchestrator.validations.done",
-            { count: results.length },
-            req,
-          );
-
-          // Build minimal payload and generate PDF
-          const payload = await buildPdfPayload({ startupRecordId });
-          const filename = suggestPdfFilename(
-            payload?.legal_name || startupName || "agreement",
-          );
-          log("info", "orchestrator.pdf.start", { filename }, req);
-          const pdfBuffer = await generatePdfBuffer(payload);
-
-          // Cache and issue a one-time URL for Airtable attach (user will get a stable redirect URL)
-          const tmpDir = path.join(os.tmpdir(), "pdf-cache");
-          await fs.ensureDir(tmpDir);
-          const tokenAirtable = crypto.randomBytes(12).toString("hex");
-          const filePathA = path.join(tmpDir, `${tokenAirtable}.pdf`);
-          await fs.writeFile(filePathA, pdfBuffer);
-          const expiresAt = new Date(Date.now() + URL_TTL_SECONDS * 1000);
-          PDF_TOKENS.set(tokenAirtable, {
-            filePath: filePathA,
-            expiresAt,
-            filename,
-          });
-
-          // Attach to Airtable Startups 'Agreement' field (append)
-          try {
-            const existing = Array.isArray(startupRec.get("Agreement"))
-              ? startupRec.get("Agreement")
-              : [];
-            const keep = existing
-              .map((att) => (att && att.id ? { id: att.id } : null))
-              .filter(Boolean);
-            const attachment = {
-              url: `${pdfBaseUrl(req)}/download/${tokenAirtable}`,
-              filename,
-            };
-            await airtableBase(process.env.UTS_STARTUPS_TABLE_ID).update(
-              startupRecordId,
-              { Agreement: [...keep, attachment] },
-            );
-            // Stamp the created date (date-only)
-            try {
-              await airtableBase(process.env.UTS_STARTUPS_TABLE_ID).update(
-                startupRecordId,
-                { "Agreement Created Date": ymd() },
-              );
-            } catch (_) {}
-            log(
-              "info",
-              "orchestrator.attach.ok",
-              { startupRecordId, countBefore: keep.length, filename },
-              req,
-            );
-          } catch (e) {
-            log(
-              "warn",
-              "orchestrator.attach.error",
-              { message: e.message },
-              req,
-            );
-          }
-
-          // In dev, also save a local copy for quick manual inspection
-          if (DEV_MODE) {
-            try {
-              const outdir =
-                process.env.PDF_OUTDIR ||
-                path.join(process.cwd(), "out", "pdfs");
-              await fs.ensureDir(outdir);
-              await fs.writeFile(path.join(outdir, filename), pdfBuffer);
-            } catch (e) {
-              /* ignore */
-            }
-          }
-
-          job.state = "done";
-          const stableUrl = `${pdfBaseUrl(req)}/agreement/latest/${req.params.token}`;
-          job.result = {
-            pdf: { url: stableUrl, filename },
-            validations: results,
-          };
-          job.finishedAt = new Date().toISOString();
-          log(
-            "info",
-            "orchestrator.done",
-            { filename, expiresAt: expiresAt.toISOString() },
-            req,
-          );
-        } catch (e) {
-          log("error", "orchestrator.exception", { message: e.message }, req);
-          job.state = "error";
-          job.result = { message: e.message };
-          job.finishedAt = new Date().toISOString();
-        }
-      })();
-
+      const message = result.alreadyRunning
+        ? "Validation/generation already in progress"
+        : "Validation and generation started";
       return res.status(202).json({
         success: true,
-        message: "Validation and generation started",
+        message,
         job: {
-          state: job.state,
-          startedAt: job.startedAt,
-          progress: job.progress,
+          state: result.job.state,
+          startedAt: result.job.startedAt,
+          progress: result.job.progress,
         },
       });
     } catch (e) {
@@ -3434,29 +5401,13 @@ app.get("/pricing-preview/:token", verifyToken, async (req, res) => {
         (s.includes("within") || s.includes("< 12"))
       )
         return "Former Staff < 12m";
-      if (
-        s.includes("former") &&
-        s.includes("staff") &&
-        (s.includes("more than") || s.includes("over") || s.includes("> 12"))
-      )
-        return "Former Staff > 12m";
+      // Deliberately do not map Former Staff > 12m anymore (non-qualifying)
       return null;
     }
 
     function effectiveDiscountCategory(rec) {
-      try {
-        const manualCheckField =
-          process.env.AIRTABLE_MEMBERS_MANUAL_OVERRIDE_FIELD ||
-          "Manual Discount Check";
-        const manualCatField =
-          process.env.AIRTABLE_MEMBERS_MANUAL_DISCOUNT_CATEGORY_FIELD ||
-          "Manual Discount Category";
-        const manualCheck = rec.get(manualCheckField) || "";
-        if (String(manualCheck).trim()) {
-          const manualCat = rec.get(manualCatField) || "";
-          if (String(manualCat).trim()) return manualCat;
-        }
-      } catch (_) {}
+      const manualInfo = manualOverrideInfo(rec);
+      if (manualInfo.hasOverride && manualInfo.category) return manualInfo.category;
       try {
         const expectedField =
           process.env.AIRTABLE_MEMBERS_EXPECTED_DISCOUNT_FIELD ||
@@ -3467,21 +5418,7 @@ app.get("/pricing-preview/:token", verifyToken, async (req, res) => {
     }
 
     function isDiscountValidated(rec) {
-      try {
-        const manualCheckField =
-          process.env.AIRTABLE_MEMBERS_MANUAL_OVERRIDE_FIELD ||
-          "Manual Discount Check";
-        const manualCatField =
-          process.env.AIRTABLE_MEMBERS_MANUAL_DISCOUNT_CATEGORY_FIELD ||
-          "Manual Discount Category";
-        const manualCheck = rec.get(manualCheckField) || "";
-        const manualCat = rec.get(manualCatField) || "";
-        
-        if (String(manualCheck).trim().toLowerCase() === 'valid' && String(manualCat).trim()) {
-          return true;
-        }
-      } catch (_) {}
-      
+      if (manualOverrideInfo(rec).hasOverride) return true;
       try {
         return String(rec.get("Discount Validated") || "")
           .trim()
@@ -3554,9 +5491,9 @@ app.get("/pricing-preview/:token", verifyToken, async (req, res) => {
     const matrix = await loadPricingMatrixViaSDK();
     const rows = [];
     let sum = 0;
-    for (const r of teamMemberRecords) {
+        for (const r of teamMemberRecords) {
       const submitted = asOne(r.get("New onboarding form submitted"));
-      if (!submitted) continue;
+      if (!(submitted || hasManualOverride(r))) continue;
       const type = normaliseType(r.get("Membership Type"));
       const expected = effectiveDiscountCategory(r);
       const validated = isDiscountValidated(r);
@@ -3576,7 +5513,12 @@ app.get("/pricing-preview/:token", verifyToken, async (req, res) => {
       sum += chosen;
       rows.push({
         id: r.id,
-        name: r.get("Team member ID") || r.get("Name") || r.id,
+        name:
+          (r.get("Name") || r.get("Full name") || r.get("Full Name") || "").toString().trim() ||
+          (String(r.get("First Name*") || "").trim() + " " + String(r.get("Last Name*") || "").trim()).trim() ||
+          (String(r.get("First Name") || "").trim() + " " + String(r.get("Last Name") || "").trim()).trim() ||
+          r.get("Team member ID") ||
+          r.id,
         type,
         discountCategory: expected,
         validated,
@@ -3659,6 +5601,57 @@ const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024 },
 }); // 10 MB
+
+app.post(
+  "/upload-photo/:token",
+  verifyToken,
+  upload.single("file"),
+  async (req, res) => {
+    try {
+      if (!req.file || !req.file.buffer) {
+        return res
+          .status(400)
+          .json({ success: false, message: "No image uploaded" });
+      }
+      const { originalname = "", mimetype = "", buffer } = req.file;
+      const allowed = [
+        "image/png",
+        "image/jpeg",
+        "image/gif",
+        "image/webp",
+        "image/jpg",
+      ];
+      const isAllowed =
+        allowed.includes(mimetype) ||
+        /\.(png|jpe?g|gif|webp)$/i.test(originalname);
+      if (!isAllowed) {
+        return res
+          .status(415)
+          .json({ success: false, message: "Unsupported image format" });
+      }
+      const photosDir = path.join(__dirname, "public", "uploads", "photos");
+      await fs.ensureDir(photosDir);
+      const safeExt = (() => {
+        const match = /\.(png|jpe?g|gif|webp)$/i.exec(originalname);
+        if (match) return match[0].toLowerCase();
+        if (mimetype === "image/png") return ".png";
+        if (mimetype === "image/gif") return ".gif";
+        if (mimetype === "image/webp") return ".webp";
+        return ".jpg";
+      })();
+      const filename = `${crypto.randomBytes(12).toString("hex")}${safeExt}`;
+      const filePath = path.join(photosDir, filename);
+      await fs.writeFile(filePath, buffer);
+      const urlPath = `/uploads/photos/${filename}`;
+      return res.json({ success: true, url: urlPath });
+    } catch (error) {
+      log("error", "photo.upload.error", { message: error?.message }, req);
+      return res
+        .status(500)
+        .json({ success: false, message: "Failed to upload photo" });
+    }
+  },
+);
 app.post(
   "/agreement/upload-signed/:token",
   verifyToken,
@@ -3901,7 +5894,8 @@ app.post(
 
 // Generate dashboard HTML
 function generateDashboardHTML(data) {
-  const { startup, teamMembers, token, isEOIApproved, formUrls } = data;
+  const { startup, teamMembers, token, isEOIApproved, formUrls, management } =
+    data;
 
   return `
 <!DOCTYPE html>
@@ -3933,40 +5927,82 @@ function generateDashboardHTML(data) {
 
         <!-- Main Content -->
         <main class="dashboard-main">
-            ${isEOIApproved && startup.onboardingSubmitted === 0 ? generateOnboardingFlow(startup, formUrls, token) : '<p style="color: red;">Onboarding section not shown - conditions not met</p>'}
+            <nav class="dashboard-tabs">
+                <button type="button" class="dashboard-tab active" data-tab-target="onboarding-section">
+                    <i class="fas fa-clipboard-list"></i> Onboarding
+                </button>
+                <button type="button" class="dashboard-tab" data-tab-target="management-section">
+                    <i class="fas fa-sliders-h"></i> Management
+                </button>
+                <button type="button" class="dashboard-tab" data-tab-target="financial-section">
+                    <i class="fas fa-file-invoice-dollar"></i> Financial Activity
+                </button>
+            </nav>
 
-            <!-- Team Management Section -->
-            <section class="team-section">
-                <div class="section-header">
-                    <h3><i class="fas fa-users"></i> Team Management</h3>
-                    <p>Manage your team members and their information</p>
-                </div>
-
-                <div class="team-grid">
-                    ${teamMembers.map((member) => generateTeamMemberCard(member, token)).join("")}
-                </div>
-
+            <section id="onboarding-section" class="tab-panel active">
                 ${
-                  teamMembers.length === 0
-                    ? `
-                <div class="empty-state">
-                    <i class="fas fa-user-plus"></i>
-                    <h4>No team members yet</h4>
-                    <p>Add team members through the onboarding process above</p>
-                </div>
-                `
-                    : ""
+                  isEOIApproved && startup.onboardingSubmitted === 0
+                    ? generateOnboardingFlow(startup, formUrls, token)
+                    : '<p class="muted-text">Onboarding is complete. You can review existing information via the management tab.</p>'
                 }
+            </section>
+
+            <section id="management-section" class="tab-panel hidden">
+                <div class="section-header">
+                    <h3><i class="fas fa-users-cog"></i> Membership & Access</h3>
+                    <p>Review current memberships, access privileges, and change history for your team.</p>
+                </div>
+
+                <div class="management-startup-info" id="management-startup-info"></div>
+                <div class="primary-contact-card" id="management-primary-contact"></div>
+
+                <div class="management-summary-grid" id="management-summary-grid"></div>
+
+                <div class="management-actions" style="display:flex;justify-content:flex-end;margin:12px 0;">
+                    <button type="button" class="btn btn-primary add-member-btn">
+                        <i class="fas fa-user-plus"></i> Add Member
+                    </button>
+                </div>
+
+                <div class="management-members-grid" id="management-members-grid"></div>
+
+                <div class="management-history">
+                    <div class="history-header">
+                        <h4><i class="fas fa-history"></i> Recent Membership Events</h4>
+                        <p class="muted-text">Latest membership changes synced from the official Membership Event History (agent base).</p>
+                    </div>
+                    <div id="management-events-list" class="history-list"></div>
+                </div>
+
+                <div class="management-requests">
+                    <div class="history-header">
+                        <h4><i class="fas fa-random"></i> Change Requests</h4>
+                        <p class="muted-text">Pending or recent membership requests.</p>
+                    </div>
+                    <div id="management-requests-list" class="history-list"></div>
+                </div>
+            </section>
+
+            <section id="financial-section" class="tab-panel hidden">
+                <div class="section-header">
+                    <h3><i class="fas fa-coins"></i> Financial Activity</h3>
+                    <p>Monitor meeting room charges, giveback credits, locker usage, and membership fees.</p>
+                </div>
+                <div class="primary-contact-card" id="financial-primary-contact"></div>
+                <div class="financial-filters" id="financial-filters"></div>
+                <div id="financial-transactions-list" class="financial-list">
+                    <div class="skeleton-list">
+                        <div class="skeleton-card"></div>
+                        <div class="skeleton-card"></div>
+                        <div class="skeleton-card"></div>
+                    </div>
+                </div>
             </section>
         </main>
     </div>
 
     <script src="/js/dashboard.js"></script>
-    <script>
-        // Initialize dashboard with data
-        window.dashboardData = ${JSON.stringify(data)};
-
-    </script>
+    <script id="dashboard-data" type="application/json">${JSON.stringify(data)}</script>
 </body>
 </html>`;
 }
@@ -4083,13 +6119,11 @@ function generateTeamMemberCard(member, token) {
                 </div>
             </div>
         </div>
-        <!-- EDIT FUNCTIONALITY COMMENTED OUT - TO REINSTATE LATER
         <div class="member-actions">
-            <button class="btn btn-outline edit-member-btn" onclick="editTeamMember('${member.id}', '${token}')">
-                <i class="fas fa-edit"></i> Edit
+            <button class="btn btn-outline edit-member-btn" data-member-id="${member.id}">
+                <i class="fas fa-edit"></i> Edit Details
             </button>
         </div>
-        -->
     </div>`;
 }
 

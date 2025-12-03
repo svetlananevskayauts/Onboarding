@@ -77,7 +77,9 @@ function initializeForm() {
         
         try {
             const controller = new AbortController();
-            const timeout = setTimeout(() => controller.abort(), 15000);
+            const isLocal = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
+            const TIMEOUT_MS = isLocal ? 60000 : 15000;
+            const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
             const response = await fetch('/lookup-email', {
                 method: 'POST',
                 headers: {
@@ -98,15 +100,21 @@ function initializeForm() {
                 throw new Error(text || 'Unexpected non-JSON response');
             }
 
+            // Special case: non-representative path
+            if (!response.ok && response.status === 403) {
+                showNotRepresentativeModal(data && data.message ? data.message : 'You are not the listed representative of a startup.');
+                return;
+            }
+
             if (data.success) {
                 showAlert('success', 'Magic link generated successfully!', 
                     'Please check your email for the access link.');
                 
                 // In development, show the magic link
-                if (data.magicLink && (window.location.hostname === 'localhost' || data.devMode === true)) {
+                if (data.magicLink && data.devMode === true) {
                     setTimeout(() => {
                         showMagicLinkModal(data.magicLink);
-                    }, 2000);
+                    }, 600);
                 }
                 
                 // Reset form
@@ -142,6 +150,31 @@ function initializeForm() {
 
     emailInput.addEventListener('blur', function() {
         this.closest('.input-container').classList.remove('focused');
+    });
+}
+
+// Non-representative modal (forms already found for this email as a team member)
+function showNotRepresentativeModal(message) {
+    const html = `
+      <div style="text-align:left">
+        <p style="margin:0 0 8px 0;">${message || 'You are not the listed representative of a startup.'}</p>
+        <ul style="margin:0 0 8px 20px; padding:0; color:#cbd5e1;">
+          <li>Ask your startup's representative to share a magic link with you, or</li>
+          <li>Try a different email if you are the nominated representative, or</li>
+          <li>Continue with onboarding using your approved EOI email.</li>
+        </ul>
+      </div>`;
+    Swal.fire({
+        icon: 'warning',
+        title: 'Representative Access Required',
+        html,
+        confirmButtonText: 'Try another email',
+        confirmButtonColor: '#6366f1',
+        background: '#1e293b',
+        color: '#f8fafc'
+    }).then(() => {
+        const input = document.getElementById('email');
+        if (input) { input.focus(); input.select(); }
     });
 }
 
@@ -227,39 +260,60 @@ function showAlert(type, title, text = '') {
 }
 
 function showMagicLinkModal(magicLink) {
-    // Always present a local dashboard link in dev popup
-    let localLink = magicLink;
+    // Derive local dashboard and agreement links for DEV
+    let localDashboard = magicLink;
+    let localAgreement = magicLink;
+    let token = '';
     try {
         const u = new URL(magicLink, window.location.origin);
         const parts = (u.pathname || '').split('/').filter(Boolean);
-        const token = parts[parts.length - 1] || '';
-        localLink = `${window.location.origin.replace(/\/$/, '')}/dashboard/${token}`;
+        token = parts[parts.length - 1] || '';
+        const origin = window.location.origin.replace(/\/$/, '');
+        localDashboard = `${origin}/dashboard/${token}`;
+        localAgreement = `${origin}/agreement/${token}`;
     } catch (e) {
-        // Fallback to origin if parsing fails
-        localLink = `${window.location.origin.replace(/\/$/, '')}/dashboard/${String(magicLink).split('/').pop()}`;
+        token = String(magicLink).split('/').pop();
+        const origin = window.location.origin.replace(/\/$/, '');
+        localDashboard = `${origin}/dashboard/${token}`;
+        localAgreement = `${origin}/agreement/${token}`;
     }
+
     Swal.fire({
         title: 'Development Mode',
         html: `
-            <p style="margin-bottom: 20px;">In production, this link would be sent to your email.</p>
-            <p style="margin-bottom: 20px;">For development, you can access your dashboard directly:</p>
-            <a href="${localLink}" 
-               style="display: inline-block; background: linear-gradient(135deg, #f59e0b 0%, #ef4444 100%); 
-                      color: white; padding: 12px 24px; border-radius: 12px; text-decoration: none; 
-                      font-weight: 600; transition: transform 0.2s;"
-               onmouseover="this.style.transform='translateY(-2px)'"
-               onmouseout="this.style.transform='translateY(0)'"
-               target="_blank">
-                Access Dashboard
-            </a>
+            <p style="margin-bottom: 12px;">In production, this link would be emailed to the user.</p>
+            <div style="display:flex; gap:10px; flex-wrap:wrap; justify-content:center; margin-bottom: 10px;">
+              <a href="${localDashboard}" target="_blank"
+                 style="display:inline-block;background:var(--gradient-success);color:#fff;padding:10px 16px;border-radius:10px;text-decoration:none;font-weight:600;">Open Dashboard</a>
+              <a href="${localAgreement}" target="_blank"
+                 style="display:inline-block;background:var(--gradient-primary);color:#fff;padding:10px 16px;border-radius:10px;text-decoration:none;font-weight:600;">Open Agreement</a>
+              <button id="copy-magic-link-btn" type="button"
+                 style="display:inline-block;background:#334155;color:#fff;padding:10px 16px;border-radius:10px;border:1px solid #475569;font-weight:600;">Copy Dashboard Link</button>
+            </div>
+            <code style="font-size:12px;color:#94a3b8;">Token: ${token}</code>
         `,
         icon: 'info',
         confirmButtonColor: '#6366f1',
         background: '#1e293b',
         color: '#f8fafc',
-        showClass: {
-            popup: 'animate__animated animate__zoomIn'
-        }
+        showConfirmButton: false,
+        didOpen: () => {
+            const btn = document.getElementById('copy-magic-link-btn');
+            if (btn && navigator.clipboard) {
+                btn.addEventListener('click', async () => {
+                    try {
+                        await navigator.clipboard.writeText(localDashboard);
+                        Swal.showToast && Swal.showToast();
+                        btn.textContent = 'Copied!';
+                        setTimeout(() => { btn.textContent = 'Copy Dashboard Link'; }, 1500);
+                    } catch (_) {
+                        btn.textContent = 'Copy failed';
+                        setTimeout(() => { btn.textContent = 'Copy Dashboard Link'; }, 1500);
+                    }
+                });
+            }
+        },
+        showClass: { popup: 'animate__animated animate__zoomIn' }
     });
 }
 

@@ -143,6 +143,11 @@ Your app will be available at `https://utss-interface.your-username.repl.co`
 
 ## 🔄 Application Flow
 
+### Discount Validation (Manual Override)
+- `AIRTABLE_MEMBERS_MANUAL_OVERRIDE_FIELD` (default: `Manual Discount Check`): when non-empty, the app bypasses live SKY validation for that member.
+- `AIRTABLE_MEMBERS_MANUAL_DISCOUNT_CATEGORY_FIELD` (default: `Manual Discount Category`): when the manual override is present, this field replaces `Discount Category` for pricing preview and agreement calculation.
+- Note: Manual override does not automatically set `Discount Validated` to "Valid"; current pricing/count logic still checks validation status where applicable.
+
 ### 1. Landing Page Access
 - User visits the homepage
 - Enters registered email address
@@ -219,6 +224,22 @@ Your app will be available at `https://utss-interface.your-username.repl.co`
 - Verify JWT secret consistency
 - Monitor error logs in Replit
 - Test magic link generation
+
+### Financial feed E2E check
+
+Run the automated smoke test to ensure financial transactions appear for a real startup account:
+
+```bash
+# Ensure the dev server is running (e.g., npm run dev)
+AUTH_TOKEN=your_auth_token npm run e2e:financial -- oujan@exportconnect.com.au --base http://localhost:5000
+```
+
+The script will:
+1. Resolve the startup record for the representative email via Airtable.
+2. Request a dev magic link (using `AUTH_TOKEN`).
+3. Call `/financial-transactions/:token` and print the totals and first entry.
+
+If the script reports “Financial feed returned 0 entries,” the dashboard will also show “No transactions found.” Iterate on the data/mapping until the script passes, then open the dashboard, switch to the **Financial Activity** tab, and confirm the same rows render in the UI.
 
 ## 📊 Analytics & Monitoring
 

@@ -5,6 +5,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const tableBody = document.getElementById('members-body');
   const pdfBtn = document.getElementById('download-pdf-btn');
   const pdfLink = document.getElementById('download-pdf-link');
+  const backHomeLink = document.getElementById('back-home-link');
   const fileInput = document.getElementById('signed-file');
   const uploadBtn = document.getElementById('upload-signed-btn');
   const uploadStatus = document.getElementById('upload-signed-status');
@@ -14,33 +15,49 @@ document.addEventListener('DOMContentLoaded', () => {
   // Start or attach to the job
   fetch(`/validate-and-generate/${token}`, { method: 'POST' }).catch(() => {});
 
-  // Poll for status
-  const interval = setInterval(async () => {
+  // Adaptive polling: quick burst, then back off
+  let ticks = 0;
+  let delay = 500; // fast for first few seconds
+  let stop = false;
+  async function poll() {
+    if (stop) return;
     try {
       const res = await fetch(`/job-status/${token}?ts=${Date.now()}`, { cache: 'no-store' });
-      if (!res.ok) return;
-      const json = await res.json();
-      if (!json.success) return;
-      const job = json.job || {};
-
-      // Update overall status
-      statusEl.textContent = renderOverall(job);
-
-      // Render members checklist
-      renderMembers(tableBody, job.members || []);
-
-      // Enable PDF button when ready
-      if (job.state === 'done' && job.result && job.result.pdf && job.result.pdf.url) {
-        pdfBtn.disabled = false;
-        pdfLink.href = job.result.pdf.url;
-        statusEl.textContent = 'Completed';
-      }
-
-      if (job.state === 'done' || job.state === 'error' || job.state === 'blocked') {
-        clearInterval(interval);
+      if (res.ok) {
+        const json = await res.json();
+        if (json.success) {
+          const job = json.job || {};
+          // Update overall status
+          statusEl.textContent = renderOverall(job);
+          // Render members checklist
+          renderMembers(tableBody, job.members || []);
+          // Enable PDF button when ready
+          if (job.state === 'done' && job.result && job.result.pdf && job.result.pdf.url) {
+            pdfBtn.disabled = false;
+            pdfLink.href = job.result.pdf.url;
+            statusEl.textContent = 'Completed';
+            stop = true;
+          }
+          if (job.state === 'error' || job.state === 'blocked') {
+            stop = true;
+          }
+        }
       }
     } catch (_) {}
-  }, 1500);
+    ticks += 1;
+    if (ticks >= 6) delay = 1500; // back off after initial burst
+    if (!stop) setTimeout(poll, delay);
+  }
+  // kick off immediately
+  poll();
+
+  // Back to Home → redirect to management tab on the dashboard
+  if (backHomeLink) {
+    backHomeLink.addEventListener('click', (e) => {
+      e.preventDefault();
+      window.location.href = `/dashboard/${token}?tab=management`;
+    });
+  }
 
   // File upload path
   if (fileInput && uploadBtn) {
@@ -70,6 +87,10 @@ document.addEventListener('DOMContentLoaded', () => {
         if (!resp.ok || !json.success) throw new Error(json.message || 'Upload failed');
         uploadStatus.textContent = 'Signed agreement uploaded.';
         uploadStatus.style.color = '#10b981';
+        // After a successful upload, go to the management tab of the dashboard
+        setTimeout(() => {
+          window.location.href = `/dashboard/${token}?tab=management`;
+        }, 400);
       } catch (e) {
         uploadStatus.textContent = e.message || 'Failed to upload';
         uploadStatus.style.color = '#ef4444';
