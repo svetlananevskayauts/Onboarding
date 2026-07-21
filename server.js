@@ -4298,6 +4298,19 @@ function getField(rec, name) {
   return String(v);
 }
 
+function clientFacingTransactionNote(value) {
+  const match = String(value || "").match(
+    /(?:^|\r?\n)Client note:\s*([^\r\n]*)/i,
+  );
+  if (!match) return "";
+  return match[1]
+    .replace(/[<>]/g, "")
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 120);
+}
+
 const financialCache = new Map();
 
 function parseCurrencyValue(value) {
@@ -4405,12 +4418,14 @@ async function fetchFinancialTransactionsForStartup(
     Math.max(FINANCIAL_TRANSACTIONS_LIMIT, 1),
     100,
   );
+  const maxRecords = Math.max(FINANCIAL_TRANSACTIONS_LIMIT, 1);
   const agentIdSet = new Set(normalizedAgentIds);
   const records = await table
     .select({
       filterByFormula: filter,
       sort: [{ field: "Timestamp", direction: "desc" }],
       pageSize: maxPageSize,
+      maxRecords,
       fields: [
         "Startup",
         "Timestamp",
@@ -4427,7 +4442,14 @@ async function fetchFinancialTransactionsForStartup(
         "Notes",
       ],
     })
-    .firstPage();
+    .all();
+  if ((records || []).length >= maxRecords) {
+    log("warn", "financial_transactions.limit_reached", {
+      startupRecordId,
+      recordCount: records.length,
+      maxRecords,
+    });
+  }
   const scopedRecords = agentIdSet.size
     ? (records || []).filter((rec) => {
         const linked = rec.get("Startup");
@@ -4444,7 +4466,7 @@ async function fetchFinancialTransactionsForStartup(
     debitAmount: parseCurrencyValue(rec.get("Debit Amount")),
     creditAmount: parseCurrencyValue(rec.get("Credit Amount")),
     billingPeriod: getField(rec, "Billing Period"),
-    notes: getField(rec, "Notes"),
+    notes: clientFacingTransactionNote(getField(rec, "Notes")),
     related: {
       bookings: rec.get("Related Booking") || [],
       givebacks: rec.get("Related Giveback") || [],
@@ -4502,11 +4524,13 @@ async function fetchMembershipTransactionsForStartup(
     filter = linkPresenceFormula;
   }
   if (!filter) return [];
+  const maxRecords = Math.max(FINANCIAL_TRANSACTIONS_LIMIT, 1);
   const records = await table
     .select({
       filterByFormula: filter,
       sort: [{ field: "Created", direction: "desc" }],
       pageSize: 100,
+      maxRecords,
       fields: [
         "Startup",
         "Startup Name",
@@ -4519,7 +4543,14 @@ async function fetchMembershipTransactionsForStartup(
         "Accounts Payable Email",
       ],
     })
-    .firstPage();
+    .all();
+  if ((records || []).length >= maxRecords) {
+    log("warn", "membership_transactions.limit_reached", {
+      startupRecordId,
+      recordCount: records.length,
+      maxRecords,
+    });
+  }
   const normalizedNameSet = new Set(normalizedNames);
   const scopedRecords = (records || []).filter((rec) => {
     const linked = rec.get("Startup");

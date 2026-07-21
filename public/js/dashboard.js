@@ -1579,6 +1579,16 @@ async function loadFinancialTransactions() {
     }
 }
 
+function escapeTransactionMeta(value) {
+    return String(value || '').replace(/[&<>"']/g, (character) => ({
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#39;',
+    })[character]);
+}
+
 function renderFinancialTransactions() {
     const container = document.getElementById('financial-transactions-list');
     if (!container) return;
@@ -1641,7 +1651,7 @@ function renderFinancialTransactions() {
                 ${(entry.billingPeriod || entry.notes)
                     ? `<div class="transaction-meta">
                            ${entry.billingPeriod ? `<span>Billing period: ${entry.billingPeriod}</span>` : ''}
-                           ${entry.notes ? `<span>Notes: ${entry.notes}</span>` : ''}
+                           ${entry.notes ? `<span>Notes: ${escapeTransactionMeta(entry.notes)}</span>` : ''}
                        </div>` : ''}
                 ${tags.length
                     ? `<div class="transaction-tags">
